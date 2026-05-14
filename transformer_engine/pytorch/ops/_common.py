@@ -97,7 +97,6 @@ def get_fp8_meta_from_fp8_tensor(tensor: Float8Tensor) -> tuple[FP8TensorMeta, i
 def validate_grouped_mlp_dims(fc1, activation_op, fc2) -> None:
     """Validate FC1 / activation / FC2 dimensions for fused grouped MLP."""
     from .basic import (  # pylint: disable=import-outside-toplevel
-        SReLU,
         ScaledSReLU,
         ScaledClampedQGeGLU,
         ScaledSwiGLU,
@@ -115,7 +114,7 @@ def validate_grouped_mlp_dims(fc1, activation_op, fc2) -> None:
         )
     if isinstance(activation_op, (ScaledSwiGLU, ScaledClampedQGeGLU)):
         expected_fc1_out_features = 2 * fc2.in_features
-    elif isinstance(activation_op, (SReLU, ScaledSReLU)):
+    elif isinstance(activation_op, ScaledSReLU):
         expected_fc1_out_features = fc2.in_features
     else:
         raise TypeError(
@@ -168,7 +167,6 @@ def fuse_grouped_mlp_ops(
     """
     from .basic import (  # pylint: disable=import-outside-toplevel
         GroupedLinear,
-        SReLU,
         ScaledSReLU,
         ScaledClampedQGeGLU,
         ScaledSwiGLU,
@@ -202,14 +200,6 @@ def fuse_grouped_mlp_ops(
         elif isinstance(window[1], ScaledClampedQGeGLU) and (
             abs(window[1]._clamped.alpha - 1.702) > 0.001
             or not _nvidia_cudnn_frontend_supports_scaled_clamped_qgeglu()
-        ):
-            matches_pattern = False
-        elif isinstance(window[1], SReLU) and window[1].cache_quantized_input:
-            matches_pattern = False
-        elif (
-            isinstance(window[1], SReLU)
-            and not isinstance(window[1], ScaledSReLU)
-            and getattr(window[2], "_scale_bias", False)
         ):
             matches_pattern = False
         elif window[0].has_bias and not fc1_bias_ok:

@@ -22,10 +22,11 @@ from ...tensor.grouped_tensor import GroupedTensor
 from ...tensor.mxfp8_tensor import MXFP8Quantizer
 from ...tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 from ...constants import MXFP8_BLOCK_SCALING_SIZE, NVFP4_BLOCK_SCALING_SIZE
-from ..basic import GroupedLinear, SReLU, ScaledSReLU, ScaledClampedQGeGLU, ScaledSwiGLU
+from ..basic import GroupedLinear, ScaledSReLU, ScaledClampedQGeGLU, ScaledSwiGLU
 from ..fuser import register_forward_fusion
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import (
+    _nvidia_cudnn_frontend_supports_wgrad,
     fuse_grouped_mlp_ops,
     is_quantized_tensor,
     maybe_dequantize,
@@ -79,6 +80,11 @@ def _grouped_gemm_dsrelu_backward_supported() -> bool:
     except ImportError:
         return False
     return grouped_gemm_dsrelu_wrapper_sm100 is not None
+
+
+def _srelu_fc2_input_recompute_enabled() -> bool:
+    """Whether SReLU backward should regenerate the FC2 input instead of saving it."""
+    return int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP_SRELU_RECOMPUTE", "1")) > 0
 
 
 def _wrap_single_nvfp4_as_grouped(
@@ -325,9 +331,13 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         *,
         fc1: GroupedLinear,
         swiglu: Optional[ScaledSwiGLU | ScaledClampedQGeGLU] = None,
-        srelu: Optional[SReLU | ScaledSReLU] = None,
+        srelu: Optional[ScaledSReLU] = None,
         fc2: GroupedLinear,
     ) -> None:
+        if swiglu is not None and srelu is not None:
+            raise TypeError(
+                "Expected exactly one activation op, but both swiglu and srelu were provided."
+            )
         activation = swiglu if swiglu is not None else srelu
         if activation is None:
             raise TypeError("Expected a grouped MLP activation op.")
@@ -336,11 +346,13 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             self.grouped_gemm_glu_kernel()  # Try triggering import error
             raise RuntimeError(f"{self.__class__.__name__} is not supported on this system.")
         validate_grouped_mlp_dims(fc1, activation, fc2)
-        # The cuDNN geglu implementation corresponds to ScaledClampedQGeGLU.
-        # The act_func string should be fixed on the cuDNN FE side.
-        if isinstance(activation, (SReLU, ScaledSReLU)):
+        if isinstance(activation, ScaledSReLU):
+            # grouped_gemm_srelu_wrapper_sm100 is SReLU-specific and does not
+            # take the GLU ``act_func`` selector.
             self._cudnn_act_func: Optional[str] = None
         else:
+            # The cuDNN geglu implementation corresponds to ScaledClampedQGeGLU.
+            # The act_func string should be fixed on the cuDNN FE side.
             self._cudnn_act_func = (
                 "geglu" if isinstance(activation, ScaledClampedQGeGLU) else "swiglu"
             )
@@ -410,7 +422,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         fc2_x_tensor_offsets = base_offsets * fc2_weight_shape[1]
 
         # Extract per-row activation probabilities from extra input when the
-        # middle op provides one. Plain SReLU uses probability 1.
+        # middle op provides one.
         scales = basic_op_extra_inputs[1][0] if basic_op_extra_inputs[1] else None
 
         # Prepare FC1 grouped weight tensor for fused kernels.
@@ -586,8 +598,8 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             )
             fc1_x_scales = fc1_x_scales.permute(3, 4, 1, 5, 2, 0)
 
-        alpha_tensor = get_cached_ones_tensor(num_groups, dtype, device)
-        norm_const_tensor = get_cached_ones_tensor(1, dtype, device)
+        alpha_tensor = get_cached_ones_tensor(num_groups, torch.float32, device)
+        norm_const_tensor = get_cached_ones_tensor(1, torch.float32, device)
         current_stream = torch.cuda.current_stream().cuda_stream
 
         fc1_bias_packed = _pack_grouped_linear_bias_for_cudnn(fc1_op)
@@ -1099,7 +1111,15 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
         # Save state for backward pass
         if requires_grad:
             mark_grouped_tensor(grouped_fc1_x, swiglu_in, scales, grouped_fc2_x)
-            activation_is_srelu = isinstance(self.basic_ops[1], (SReLU, ScaledSReLU))
+            activation_is_srelu = isinstance(self.basic_ops[1], ScaledSReLU)
+            recompute_srelu_fc2_x = (
+                activation_is_srelu
+                and weight_requires_grad
+                and _srelu_fc2_input_recompute_enabled()
+                and _grouped_gemm_dsrelu_backward_supported()
+                and not use_nvfp4
+                and _nvidia_cudnn_frontend_supports_wgrad()
+            )
 
             if activation_is_srelu and not _grouped_gemm_dsrelu_backward_supported():
                 _debug_srelu_fc2_x(grouped_fc2_x)
@@ -1188,14 +1208,16 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             fc1_ctx.base_split_offsets = base_offsets
 
             # Activation
+            activation_op = self.basic_ops[1]
             activation_ctx.save_for_backward(swiglu_in, scales)
+            activation_ctx.extra_input_requires_grad = True
+            if isinstance(activation_op, ScaledSReLU):
+                activation_ctx.prev_op_grad_output_quantizer = fc1_grad_output_quantizer
             activation_ctx.input_requires_grad = True
-            activation_ctx.extra_input_requires_grad = scales is not None
             activation_ctx.dtype = dtype
-            activation_ctx.prev_op_grad_output_quantizer = fc1_grad_output_quantizer
 
             # FC2 state
-            if grouped_fc2_x is not None:
+            if grouped_fc2_x is not None and not recompute_srelu_fc2_x:
                 fc2_input_tensors = (
                     grouped_fc2_x.rowwise_data,
                     grouped_fc2_x.columnwise_data,
@@ -1222,12 +1244,13 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             fc2_ctx.dtype = dtype
             fc2_ctx.input_requires_grad = input_requires_grad
             fc2_ctx.weight_requires_grad = weight_requires_grad
+            fc2_ctx.recompute_input_from_dsrelu = recompute_srelu_fc2_x
 
         return fc2_out, [(), (), ()]
 
 
 class ForwardGroupedMLP_CuTeGEMMSReLU_MXFP8(ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8):
-    """Fused op for GroupedLinear + SReLU + GroupedLinear.
+    """Fused op for GroupedLinear + ScaledSReLU + GroupedLinear.
 
     Uses experimental CuTe DSL grouped GEMM + sReLU kernel from cuDNN front-end.
     """
@@ -1282,13 +1305,13 @@ def fuse_forward_srelu_ops(
     recipe: Optional[Recipe] = None,
     **unused,  # pylint: disable=unused-argument
 ) -> list[FusibleOperation]:
-    """Apply GroupedLinear + SReLU + GroupedLinear fusion for forward pass."""
+    """Apply GroupedLinear + ScaledSReLU + GroupedLinear fusion for forward pass."""
 
     return fuse_grouped_mlp_ops(
         ops,
         recipe=recipe,
         fused_op_cls=ForwardGroupedMLP_CuTeGEMMSReLU_MXFP8,
-        activation_op_types=(SReLU, ScaledSReLU),
+        activation_op_types=(ScaledSReLU,),
         activation_kwarg="srelu",
     )
 
