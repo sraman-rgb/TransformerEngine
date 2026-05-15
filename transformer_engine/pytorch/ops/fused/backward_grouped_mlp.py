@@ -71,6 +71,21 @@ def _mark_with_gemm_swizzled_scales(tensors: Any) -> None:
         tensors._with_gemm_swizzled_scales = True
 
 
+def _clear_grouped_storage(tensor: Any) -> None:
+    """Clear grouped tensor backing buffers across grouped storage variants."""
+    rowwise_data = (
+        getattr(tensor, "data", None)
+        if hasattr(tensor, "data")
+        else getattr(tensor, "rowwise_data", None)
+    )
+    clear_tensor_data(
+        rowwise_data,
+        getattr(tensor, "columnwise_data", None),
+        getattr(tensor, "scale_inv", None),
+        getattr(tensor, "columnwise_scale_inv", None),
+    )
+
+
 def _enable_nvfp4_rht_for_group_quantize(quantizer) -> None:
     """Use the graph-safe NVFP4 grouped quantization path."""
     if isinstance(quantizer, NVFP4Quantizer):
@@ -667,7 +682,8 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
     ]:
 
         # Get basic operations
-        fc1_op, _, fc2_op = self.basic_ops
+        fc1_op, activation_op, fc2_op = self.basic_ops
+        activation_is_srelu = isinstance(activation_op, ScaledSReLU)
         fc1_ctx, activation_ctx, fc2_ctx = basic_op_ctxs
 
         # Tensor properties
@@ -905,9 +921,15 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             _amax_fc2_w_col = _nvfp4_amax(grouped_fc2_weight, columnwise=True)
             _nvfp4_fp4_max = 6.0
             _nvfp4_fp8_max = 448.0
-            fc2_alpha_tensor = (
-                torch.sqrt(_amax_fc2_dy * _amax_fc2_w_col) / (_nvfp4_fp8_max * _nvfp4_fp4_max)
-            ).expand(num_groups)
+            if activation_is_srelu:
+                fc2_alpha_tensor = (
+                    _amax_fc2_dy * _amax_fc2_w_col / (_nvfp4_fp4_max**2 * _nvfp4_fp8_max**2)
+                ).to(torch.float32)
+            else:
+                fc2_alpha_tensor = (
+                    torch.sqrt(_amax_fc2_dy * _amax_fc2_w_col)
+                    / (_nvfp4_fp8_max * _nvfp4_fp4_max)
+                ).expand(num_groups)
             fc2_beta_tensor = get_cached_ones_tensor(num_groups, torch.float32, device)
             fc2_norm_const_tensor = None
         else:
@@ -1037,28 +1059,44 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             if recomputed_fc2_x_offsets is None:
                 recomputed_fc2_x_offsets = fc1_ctx.base_split_offsets * fc2_weight_shape[1]
 
-            sfd_col_d_srelu_tensor = fc2_dgrad_kernel_out.get("sfd_col_d_srelu_tensor")
-            if sfd_col_d_srelu_tensor is None:
-                raise RuntimeError(
-                    "SReLU recompute is enabled, but the DSReLU kernel did not return "
-                    "the recomputed FC2 input column scale tensor."
+            if use_nvfp4:
+                fc2_x_bf16 = d_srelu_tensor.view(
+                    out_shape[0], fc2_weight_shape[1]
+                ).contiguous()
+                fc2_ctx.input_quantizer.set_usage(rowwise=True, columnwise=True)
+                fc2_ctx.input_quantizer.optimize_for_gemm = True
+                _enable_nvfp4_rht_for_group_quantize(fc2_ctx.input_quantizer)
+                grouped_fc2_x = _group_quantize_for_grouped_mlp(
+                    fc2_x_bf16,
+                    fc2_ctx.input_quantizer,
+                    num_groups,
+                    split_sizes,
+                    tensor_offsets=recomputed_fc2_x_offsets,
                 )
+                _mark_with_gemm_swizzled_scales(grouped_fc2_x)
+            else:
+                sfd_col_d_srelu_tensor = fc2_dgrad_kernel_out.get("sfd_col_d_srelu_tensor")
+                if sfd_col_d_srelu_tensor is None:
+                    raise RuntimeError(
+                        "SReLU recompute is enabled, but the DSReLU kernel did not return "
+                        "the recomputed FC2 input column scale tensor."
+                    )
 
-            fc2_x_col_data = d_srelu_tensor.view(out_shape[0], fc2_weight_shape[1])
-            fc2_x_col_scale = sfd_col_d_srelu_tensor.permute(5, 2, 4, 0, 1, 3)
-            grouped_fc2_x = GroupedTensor(
-                shape=(out_shape[0], fc2_weight_shape[1]),
-                dtype=dtype,
-                num_tensors=num_groups,
-                quantizer=fc2_ctx.input_quantizer,
-                data=None,
-                columnwise_data=fc2_x_col_data.reshape(-1),
-                scale_inv=None,
-                columnwise_scale_inv=fc2_x_col_scale.reshape(-1),
-                first_dims=split_sizes,
-                tensor_offsets=recomputed_fc2_x_offsets,
-                with_gemm_swizzled_scales=True,
-            )
+                fc2_x_col_data = d_srelu_tensor.view(out_shape[0], fc2_weight_shape[1])
+                fc2_x_col_scale = sfd_col_d_srelu_tensor.permute(5, 2, 4, 0, 1, 3)
+                grouped_fc2_x = GroupedTensor(
+                    shape=(out_shape[0], fc2_weight_shape[1]),
+                    dtype=dtype,
+                    num_tensors=num_groups,
+                    quantizer=fc2_ctx.input_quantizer,
+                    data=None,
+                    columnwise_data=fc2_x_col_data.reshape(-1),
+                    scale_inv=None,
+                    columnwise_scale_inv=fc2_x_col_scale.reshape(-1),
+                    first_dims=split_sizes,
+                    tensor_offsets=recomputed_fc2_x_offsets,
+                    with_gemm_swizzled_scales=True,
+                )
 
         fc2_bias_grads: Optional[list[Optional[torch.Tensor]]] = None
         fc2_bias_grad_packed: Optional[torch.Tensor] = None
@@ -1178,12 +1216,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             and fc2_op.wgrad_store is not None
             and fc2_op.wgrad_store.delay_wgrad_compute()
         ):
-            clear_tensor_data(
-                grouped_fc2_x.data,
-                grouped_fc2_x.columnwise_data,
-                grouped_fc2_x.scale_inv,
-                grouped_fc2_x.columnwise_scale_inv,
-            )
+            _clear_grouped_storage(grouped_fc2_x)
 
         # FC1 dgrad GEMM
         grad_input = None
@@ -1323,12 +1356,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
             and fc1_op.wgrad_store is not None
             and fc1_op.wgrad_store.delay_wgrad_compute()
         ):
-            clear_tensor_data(
-                grouped_fc1_x.data,
-                grouped_fc1_x.columnwise_data,
-                grouped_fc1_x.scale_inv,
-                grouped_fc1_x.columnwise_scale_inv,
-            )
+            _clear_grouped_storage(grouped_fc1_x)
 
         fc2_grad_extra = (None, None) if fc2_op._scale_bias else (None,)
         activation_grad_extra = (grad_scales,) if grad_scales is not None else ()

@@ -1117,7 +1117,6 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                 and weight_requires_grad
                 and _srelu_fc2_input_recompute_enabled()
                 and _grouped_gemm_dsrelu_backward_supported()
-                and not use_nvfp4
                 and _nvidia_cudnn_frontend_supports_wgrad()
             )
 

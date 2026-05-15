@@ -230,12 +230,17 @@ class GroupedLinear(BasicOperation):
         if isinstance(activations, list):
             clear_tensor_data(*activations)
         else:
-            # Fused MXFP8 grouped MLP saves `GroupedTensor` activations for wgrad.
+            # Fused grouped MLP saves grouped activation storage for delayed wgrad.
+            rowwise_data = (
+                activations.data
+                if hasattr(activations, "data")
+                else getattr(activations, "rowwise_data", None)
+            )
             clear_tensor_data(
-                activations.data,
-                activations.columnwise_data,
-                activations.scale_inv,
-                activations.columnwise_scale_inv,
+                rowwise_data,
+                getattr(activations, "columnwise_data", None),
+                getattr(activations, "scale_inv", None),
+                getattr(activations, "columnwise_scale_inv", None),
             )
         if self._accumulate_into_main_grad:
             self._trigger_wgrad_accumulation_and_reduce_hooks()
