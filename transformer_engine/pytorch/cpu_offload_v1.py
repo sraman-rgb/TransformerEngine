@@ -36,6 +36,8 @@ def mark_activation_offload(*tensors, offload: bool = True):
                 tensor._TE_do_not_offload = True
         else:
             data_tensors = tensor.get_data_tensors()
+            if not offload:
+                tensor._TE_do_not_offload = True
             for tensor in data_tensors:
                 if tensor is not None:
                     if offload:

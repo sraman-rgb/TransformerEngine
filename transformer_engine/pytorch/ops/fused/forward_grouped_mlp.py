@@ -13,10 +13,12 @@ from typing import Any, Optional
 import torch
 
 import transformer_engine_torch as tex
+from ...cpu_offload import mark_not_offload
 from ...quantization import Recipe
 from ...tensor import Quantizer
 from ...utils import get_cached_ones_tensor, get_device_compute_capability, mark_grouped_tensor
 from ...tensor.grouped_tensor import GroupedTensor
+from ...tensor.storage.grouped_tensor_storage import GroupedTensorStorage
 from ...tensor.mxfp8_tensor import MXFP8Quantizer
 from ...constants import MXFP8_BLOCK_SCALING_SIZE
 from ..basic import GroupedLinear, ScaledSReLU, ScaledClampedQGeGLU
@@ -46,6 +48,43 @@ def _pack_grouped_linear_bias_for_cudnn(linear_op: GroupedLinear) -> Optional[to
     rows = [getattr(linear_op, f"bias{group_idx}") for group_idx in range(num_groups)]
     # stack to [num_groups, n] but cuDNN expects [n, num_groups] with stride [1, n].
     return torch.stack(rows, dim=0).transpose(0, 1)
+
+
+def _as_grouped_tensor_storage(tensor: Optional[GroupedTensor]) -> Optional[GroupedTensorStorage]:
+    """Create a lightweight saved activation object from a grouped tensor."""
+    if tensor is None:
+        return None
+    return GroupedTensorStorage(
+        shape=tensor.logical_shape,
+        dtype=tensor.fake_dtype,
+        num_tensors=tensor.num_tensors,
+        shapes=tensor.tensor_shapes,
+        quantizer=tensor.quantizer,
+        data=tensor.rowwise_data,
+        columnwise_data=tensor.columnwise_data,
+        scale_inv=tensor.scale_inv,
+        columnwise_scale_inv=tensor.columnwise_scale_inv,
+        amax=tensor.amax,
+        columnwise_amax=tensor.columnwise_amax,
+        scale=tensor.scale,
+        first_dims=tensor.first_dims,
+        last_dims=tensor.last_dims,
+        tensor_offsets=tensor.tensor_offsets,
+        offsets=tensor.offsets,
+        scale_inv_offsets=tensor.scale_inv_offsets,
+        columnwise_scale_inv_offsets=tensor.columnwise_scale_inv_offsets,
+        with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
+        row_scaled_nvfp4=tensor.row_scaled_nvfp4,
+    )
+
+
+def _mark_not_offload_if_disabled(should_offload: bool, *tensors: Any) -> None:
+    """Apply TE's offload skip marker when a saved activation is disabled."""
+    if should_offload:
+        return
+    tensors = tuple(tensor for tensor in tensors if tensor is not None)
+    if tensors:
+        mark_not_offload(*tensors)
 
 
 @functools.lru_cache(maxsize=1)
@@ -480,6 +519,13 @@ class _ForwardGroupedMLP_CuTeGEMMBase_MXFP8(FusedOperation):
         if requires_grad:
             mark_grouped_tensor(grouped_fc1_x, activation_in, scales, grouped_fc2_x)
             activation_op = self.basic_ops[1]
+            selective_offload = hasattr(fc1_op, "activation_offloading") or hasattr(
+                activation_op, "activation_offloading"
+            )
+            offload_fc1_input = bool(getattr(fc1_op, "activation_offloading", False))
+            offload_activation_input = bool(
+                getattr(activation_op, "activation_offloading", False)
+            )
             activation_is_srelu = isinstance(activation_op, ScaledSReLU)
             activation_recompute_in_mlp = bool(
                 getattr(activation_op, "activation_recompute_in_mlp", False)
@@ -498,6 +544,8 @@ class _ForwardGroupedMLP_CuTeGEMMBase_MXFP8(FusedOperation):
                 if grouped_fc_x is not None:
                     grouped_fc_x.rowwise_data = None
                     grouped_fc_x.scale_inv = None
+            saved_grouped_fc1_x = _as_grouped_tensor_storage(grouped_fc1_x)
+            saved_grouped_fc2_x = _as_grouped_tensor_storage(saved_grouped_fc2_x)
 
             # FC1 saved-tensor layout.
             #   [split_sizes, base_split_offsets, split_points,
@@ -505,11 +553,19 @@ class _ForwardGroupedMLP_CuTeGEMMBase_MXFP8(FusedOperation):
             fc1_weight_tensors = (
                 [grouped_fc1_weight] if fc1_op.single_grouped_weight else grouped_fc1_weight
             )
+            fc2_weight_tensors = (
+                [grouped_fc2_weight] if fc2_op.single_grouped_weight else grouped_fc2_weight
+            )
+            if selective_offload:
+                _mark_not_offload_if_disabled(offload_fc1_input, saved_grouped_fc1_x)
+                _mark_not_offload_if_disabled(offload_activation_input, activation_in, scales)
+                _mark_not_offload_if_disabled(False, saved_grouped_fc2_x)
+                mark_not_offload(*fc1_weight_tensors, *fc2_weight_tensors)
             fc1_ctx.save_for_backward(
                 split_sizes,
                 base_split_offsets,
                 split_points,
-                grouped_fc1_x,
+                saved_grouped_fc1_x,
                 *fc1_weight_tensors,
             )
             fc1_ctx.use_grouped_tensor_path = True
@@ -535,10 +591,7 @@ class _ForwardGroupedMLP_CuTeGEMMBase_MXFP8(FusedOperation):
             #   [split_sizes, base_split_offsets, split_points,
             #    (fc2_scales if _scale_bias),
             #    grouped_fc2_x, *fc2_weight_tensors]
-            fc2_weight_tensors = (
-                [grouped_fc2_weight] if fc2_op.single_grouped_weight else grouped_fc2_weight
-            )
-            fc2_saved: list[Optional[torch.Tensor]] = [
+            fc2_saved: list[Optional[torch.Tensor | GroupedTensorStorage]] = [
                 split_sizes,
                 base_split_offsets,
                 split_points,
