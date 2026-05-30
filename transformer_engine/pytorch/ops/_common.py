@@ -61,36 +61,26 @@ def _nvidia_cudnn_frontend_supports_wgrad() -> bool:
     return _cudnn_frontend_version_supported()
 
 
-def _group_quantize_for_grouped_mlp(
+def _wrap_single_nvfp4_as_grouped(
     tensor: torch.Tensor,
-    quantizer: Quantizer,
-    num_groups: int,
+    quantized: object,
+    quantizer: NVFP4Quantizer,
     split_sizes: Optional[torch.Tensor],
     *,
     tensor_offsets: Optional[torch.Tensor] = None,
 ) -> GroupedTensor:
-    """Quantize into grouped storage."""
-
-    # Typical case: group-quantize
-    if num_groups != 1 or not isinstance(quantizer, NVFP4Quantizer):
-        return tex.group_quantize(tensor, quantizer, num_groups, split_sizes)
-
-    # --------------------------------------------------
-    # Special case: single-tensor NVFP4 quantize
-    # --------------------------------------------------
-
-    quantized = tex.quantize(tensor, quantizer)
-    with_gemm_swizzled_scales = quantized._with_gemm_swizzled_scales
-    if quantizer.optimize_for_gemm:
+    """Wrap a single NVFP4 tensor in GroupedTensor storage."""
+    with_gemm_swizzled_scales = getattr(quantized, "_with_gemm_swizzled_scales", False)
+    if getattr(quantizer, "optimize_for_gemm", False):
         tex.swizzle_scales_for_gemm_(quantized)
         with_gemm_swizzled_scales = True
 
-    rowwise_data = quantized._rowwise_data
-    rowwise_scale = quantized._rowwise_scale_inv
-    columnwise_data = quantized._columnwise_data
-    columnwise_scale = quantized._columnwise_scale_inv
-    amax = quantized._amax_rowwise
-    columnwise_amax = quantized._amax_columnwise
+    rowwise_data = getattr(quantized, "_rowwise_data", None)
+    rowwise_scale = getattr(quantized, "_rowwise_scale_inv", None)
+    columnwise_data = getattr(quantized, "_columnwise_data", None)
+    columnwise_scale = getattr(quantized, "_columnwise_scale_inv", None)
+    amax = getattr(quantized, "_amax_rowwise", None)
+    columnwise_amax = getattr(quantized, "_amax_columnwise", None)
 
     if split_sizes is None:
         split_sizes = torch.full((1,), tensor.shape[0], dtype=torch.int64, device=tensor.device)
@@ -127,6 +117,65 @@ def _group_quantize_for_grouped_mlp(
         first_dims=split_sizes,
         tensor_offsets=tensor_offsets,
         with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+    )
+
+
+def _group_quantize_for_grouped_mlp(
+    tensor: torch.Tensor,
+    quantizer: Quantizer,
+    num_groups: int,
+    split_sizes: Optional[torch.Tensor],
+    *,
+    tensor_offsets: Optional[torch.Tensor] = None,
+) -> GroupedTensor:
+    """Quantize into grouped storage."""
+
+    if num_groups != 1 or not isinstance(quantizer, NVFP4Quantizer):
+        return tex.group_quantize(tensor, quantizer, num_groups, split_sizes)
+
+    quantized = tex.quantize(tensor, quantizer)
+    return _wrap_single_nvfp4_as_grouped(
+        tensor,
+        quantized,
+        quantizer,
+        split_sizes,
+        tensor_offsets=tensor_offsets,
+    )
+
+
+def _group_quantize_with_amax_for_grouped_mlp(
+    tensor: torch.Tensor,
+    quantizer: Quantizer,
+    num_groups: int,
+    split_sizes: Optional[torch.Tensor],
+    rowwise_amax: torch.Tensor,
+    columnwise_amax: torch.Tensor,
+    *,
+    tensor_offsets: Optional[torch.Tensor] = None,
+) -> GroupedTensor:
+    """Quantize with precomputed NVFP4 amaxes into grouped storage."""
+    if num_groups != 1 or not isinstance(quantizer, NVFP4Quantizer):
+        return tex.group_quantize_with_amax(
+            tensor,
+            quantizer,
+            num_groups,
+            split_sizes,
+            rowwise_amax,
+            columnwise_amax,
+        )
+
+    quantized = tex.quantize_with_amax(
+        tensor,
+        quantizer,
+        rowwise_amax.view(-1)[:1],
+        columnwise_amax.view(-1)[:1],
+    )
+    return _wrap_single_nvfp4_as_grouped(
+        tensor,
+        quantized,
+        quantizer,
+        split_sizes,
+        tensor_offsets=tensor_offsets,
     )
 
 

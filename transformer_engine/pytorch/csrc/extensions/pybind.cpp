@@ -129,6 +129,14 @@ void init_extension() {
   });
 }
 
+void bind_quantize_with_amax_extensions(py::module_ &m) {
+  m.def("quantize_with_amax", quantize_with_amax, py::arg("tensor"), py::arg("quantizer"),
+        py::arg("rowwise_amax"), py::arg("columnwise_amax"));
+  m.def("group_quantize_with_amax", group_quantize_with_amax, py::arg("tensor"),
+        py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"),
+        py::arg("rowwise_amax"), py::arg("columnwise_amax"));
+}
+
 }  // namespace transformer_engine::pytorch
 
 #include "common/util/pybind_helper.h"
@@ -145,6 +153,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("dtype"), py::arg("device"), py::arg("pin_memory"));
   m.def("group_quantize", transformer_engine::pytorch::group_quantize, py::arg("tensor"),
         py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"));
+  transformer_engine::pytorch::bind_quantize_with_amax_extensions(m);
   m.def("group_dequantize", transformer_engine::pytorch::group_dequantize,
         "Dequantize group tensor", py::arg("input"), py::arg("otype"));
   m.def("bgrad_group_quantize", transformer_engine::pytorch::bgrad_group_quantize,

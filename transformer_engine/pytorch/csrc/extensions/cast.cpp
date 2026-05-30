@@ -65,6 +65,112 @@ py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::ob
   return output_py;
 }
 
+py::object quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,
+                              const at::Tensor &rowwise_amax,
+                              const at::Tensor &columnwise_amax) {
+  using namespace transformer_engine::pytorch::detail;
+  init_extension();
+
+  NVTE_CHECK(tensor.dim() >= 2, "Tensor must be at least 2D");
+  NVTE_CHECK(rowwise_amax.is_cuda() && columnwise_amax.is_cuda(),
+             "Precomputed amax tensors must be CUDA tensors.");
+  NVTE_CHECK(rowwise_amax.scalar_type() == at::kFloat &&
+                 columnwise_amax.scalar_type() == at::kFloat,
+             "Precomputed amax tensors must be float32.");
+  NVTE_CHECK(rowwise_amax.numel() == 1 && columnwise_amax.numel() == 1,
+             "Single-tensor quantize_with_amax expects scalar rowwise and columnwise amaxes.");
+
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  NVTE_CHECK(IsNVFP4Quantizers(quantizer.ptr()),
+             "quantize_with_amax only supports NVFP4 quantizers.");
+  NVFP4Quantizer *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer_cpp.get());
+  NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization,
+             "quantize_with_amax does not support 2D NVFP4 quantization.");
+  NVTE_CHECK(nvfp4_quantizer_cpp->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled,
+             "quantize_with_amax does not support NVFP4 4over6 quantization.");
+  NVTE_CHECK(nvfp4_quantizer_cpp->with_rht,
+             "quantize_with_amax only supports NVFP4 RHT quantization.");
+  NVTE_CHECK(nvfp4_quantizer_cpp->with_post_rht_amax,
+             "quantize_with_amax expects rowwise and post-RHT amax buffers.");
+
+  auto input_contiguous = tensor.contiguous();
+  auto input_cpp = makeTransformerEngineTensor(input_contiguous);
+  NVTE_CHECK(input_cpp.dtype() == DType::kBFloat16,
+             "quantize_with_amax RHT path requires BF16 input.");
+
+  size_t rows = 1;
+  for (size_t i = 0; i < input_cpp.ndim() - 1; ++i) {
+    rows *= input_cpp.size(i);
+  }
+  const size_t cols = input_cpp.size(input_cpp.ndim() - 1);
+  NVTE_CHECK(rows % 64 == 0 && cols % 128 == 0,
+             "quantize_with_amax requires row_col_rht eligible shapes, got rows=", rows,
+             " cols=", cols);
+
+  const auto shape = get_tensor_shape(input_cpp);
+  const auto fake_dtype = input_cpp.dtype();
+  auto [output_cpp, output_py] = quantizer_cpp->create_tensor(shape, fake_dtype);
+
+  if (output_cpp.get_amax().data_ptr != nullptr) {
+    output_cpp.set_amax(rowwise_amax.data_ptr(), DType::kFloat32, getTensorShape(rowwise_amax));
+    output_py.attr("_amax_rowwise") = py::cast(rowwise_amax);
+  }
+  if (output_cpp.get_columnwise_amax().data_ptr != nullptr) {
+    output_cpp.set_columnwise_amax(columnwise_amax.data_ptr(), DType::kFloat32,
+                                   getTensorShape(columnwise_amax));
+    output_py.attr("_amax_columnwise") = py::cast(columnwise_amax);
+  }
+
+  if (input_cpp.numel() == 0) {
+    return output_py;
+  }
+
+  if (nvfp4_quantizer_cpp->with_amax_reduction) {
+    std::vector<at::Tensor> amax_tensors;
+    if (output_cpp.get_amax().data_ptr != nullptr) {
+      amax_tensors.push_back(rowwise_amax);
+    }
+    if (output_cpp.get_columnwise_amax().data_ptr != nullptr) {
+      amax_tensors.push_back(columnwise_amax);
+    }
+    c10d::AllreduceCoalescedOptions opts;
+    opts.reduceOp = c10d::ReduceOp::MAX;
+    NVTE_SCOPED_GIL_RELEASE({
+      nvfp4_quantizer_cpp->amax_reduction_group->allreduce_coalesced(amax_tensors, opts)->wait();
+    });
+  }
+
+  QuantizationConfigWrapper quant_config;
+  quant_config.set_stochastic_rounding(nvfp4_quantizer_cpp->stochastic_rounding);
+
+  at::Tensor rng_states_tensor;
+  TensorWrapper te_rng_state;
+  if (nvfp4_quantizer_cpp->stochastic_rounding) {
+    const size_t rng_elts_per_thread = 1024;
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+    auto opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+    rng_states_tensor = torch::empty({2}, opts);
+    philox_unpack(philox_args, static_cast<int64_t *>(rng_states_tensor.data_ptr()));
+    te_rng_state = makeTransformerEngineTensor(rng_states_tensor);
+    quant_config.set_rng_state(te_rng_state.data());
+  }
+
+  if (transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH")) {
+    quant_config.set_use_fast_math(true);
+  }
+
+  auto rht_matrix_nvte = makeTransformerEngineTensor(nvfp4_quantizer_cpp->rht_matrix);
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_quantize_with_hadamard_transform(input_cpp.data(), output_cpp.data(),
+                                          rht_matrix_nvte.data(), quant_config,
+                                          at::cuda::getCurrentCUDAStream());
+  });
+
+  return output_py;
+}
+
 py::object create_empty_quantized_tensor(py::handle quantizer, const std::vector<size_t> &shape,
                                          at::ScalarType dtype, at::Device device, bool pin_memory) {
   auto quantizer_cpp = convert_quantizer(quantizer);
@@ -149,6 +255,58 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   }
 }
 
+void group_quantize_nvfp4_impl_with_amax(const GroupedTensorWrapper &grouped_input_tensor,
+                                         GroupedTensorWrapper &grouped_output_tensor,
+                                         NVFP4Quantizer *nvfp4_quantizer_cpp,
+                                         cudaStream_t stream) {
+  const size_t num_tensors = grouped_input_tensor.num_tensors();
+
+  NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization,
+             "2D scaling grouped quant kernel is not ready yet");
+  NVTE_CHECK(nvfp4_quantizer_cpp->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled,
+             "NVFP4 4over6 quantization is not supported for grouped quantization.");
+  NVTE_CHECK(nvfp4_quantizer_cpp->with_rht,
+             "group_quantize_with_amax only supports NVFP4 grouped RHT quantization.");
+  NVTE_CHECK(nvfp4_quantizer_cpp->with_post_rht_amax,
+             "group_quantize_with_amax expects rowwise and post-RHT amax buffers.");
+
+  auto quant_config_cpp = QuantizationConfigWrapper();
+
+  bool need_stochastic_rounding = nvfp4_quantizer_cpp->stochastic_rounding;
+  auto opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  at::Tensor rng_states_tensor;
+  TensorWrapper te_rng_state;
+
+  if (need_stochastic_rounding) {
+    const size_t rng_elts_per_thread = 1024 * num_tensors;
+    rng_states_tensor = torch::empty({2}, opts);
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+    at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+    philox_unpack(philox_args, static_cast<int64_t *>(rng_states_tensor.data_ptr()));
+
+    te_rng_state = makeTransformerEngineTensor(rng_states_tensor);
+    quant_config_cpp.set_rng_state(te_rng_state.data());
+    quant_config_cpp.set_stochastic_rounding(true);
+  }
+
+  const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
+  if (use_fast_math) {
+    quant_config_cpp.set_use_fast_math(true);
+  }
+
+  auto tile_scheduler_workspace_torch =
+      at::empty({1}, at::device(at::kCUDA).dtype(torch::kInt32));
+  auto nvte_tile_scheduler_workspace = makeTransformerEngineTensor(tile_scheduler_workspace_torch);
+
+  auto rht_matrix_nvte = makeTransformerEngineTensor(nvfp4_quantizer_cpp->rht_matrix);
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_group_hadamard_transform_cast_fusion_graph_safe(
+        grouped_input_tensor.data(), grouped_output_tensor.data(), rht_matrix_nvte.data(),
+        quant_config_cpp, nvte_tile_scheduler_workspace.data(), stream);
+  });
+}
+
 }  // namespace
 
 // NOTE: Only supports varying first dim.
@@ -223,6 +381,70 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
       NVTE_ERROR("group_quantize: only support NVFP4 or MXFP8 quantizer.");
       break;
   }
+
+  return py::reinterpret_borrow<py::object>(grouped_output_py);
+}
+
+py::object group_quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,
+                                    const size_t num_tensors,
+                                    std::optional<at::Tensor> first_dims,
+                                    const at::Tensor &rowwise_amax,
+                                    const at::Tensor &columnwise_amax) {
+  using namespace transformer_engine::pytorch::detail;
+  init_extension();
+
+  NVTE_CHECK(tensor.dim() == 2, "Tensor must be 2D");
+  NVTE_CHECK(rowwise_amax.is_cuda() && columnwise_amax.is_cuda(),
+             "Precomputed amax tensors must be CUDA tensors.");
+  NVTE_CHECK(rowwise_amax.scalar_type() == at::kFloat &&
+                 columnwise_amax.scalar_type() == at::kFloat,
+             "Precomputed amax tensors must be float32.");
+  NVTE_CHECK(rowwise_amax.numel() == static_cast<int64_t>(num_tensors),
+             "Rowwise amax must contain one value per group.");
+  NVTE_CHECK(columnwise_amax.numel() == static_cast<int64_t>(num_tensors),
+             "Columnwise amax must contain one value per group.");
+
+  std::vector<size_t> logical_shape;
+  for (const auto &d : tensor.sizes()) {
+    logical_shape.push_back(d);
+  }
+  const auto logical_first_dim = logical_shape[0];
+  const auto logical_last_dim = logical_shape[1];
+
+  bool empty_input_buffer = logical_first_dim == 0 || logical_last_dim == 0;
+
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  NVTE_CHECK(IsNVFP4Quantizers(quantizer.ptr()),
+             "group_quantize_with_amax only supports NVFP4 quantizers.");
+  NVFP4Quantizer *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer_cpp.get());
+
+  auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
+  grouped_input_tensor.set_rowwise_data(
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+
+  auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
+      num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
+      py::reinterpret_borrow<py::object>(quantizer), first_dims, logical_first_dim,
+      logical_last_dim);
+
+  if (grouped_output_tensor_cpp.get_amax().data_ptr != nullptr) {
+    grouped_output_tensor_cpp.set_amax(rowwise_amax.data_ptr(), DType::kFloat32,
+                                       getTensorShape(rowwise_amax));
+    grouped_output_py.attr("amax") = py::cast(rowwise_amax);
+  }
+  if (grouped_output_tensor_cpp.get_columnwise_amax().data_ptr != nullptr) {
+    grouped_output_tensor_cpp.set_columnwise_amax(columnwise_amax.data_ptr(), DType::kFloat32,
+                                                  getTensorShape(columnwise_amax));
+    grouped_output_py.attr("columnwise_amax") = py::cast(columnwise_amax);
+  }
+
+  if (empty_input_buffer) {
+    return py::reinterpret_borrow<py::object>(grouped_output_py);
+  }
+
+  group_quantize_nvfp4_impl_with_amax(grouped_input_tensor, grouped_output_tensor_cpp,
+                                      nvfp4_quantizer_cpp,
+                                      at::cuda::getCurrentCUDAStream());
 
   return py::reinterpret_borrow<py::object>(grouped_output_py);
 }
