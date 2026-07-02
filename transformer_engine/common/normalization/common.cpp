@@ -304,7 +304,7 @@ CudnnNormalizationPlan::CudnnNormalizationPlan(NVTE_Norm_Type NormType, NVTE_Nor
 
     if (_training) _rsigma->set_output(true).set_data_type(get_cudnn_fe_dtype(ctype));
 
-    const auto ZDtype = _fp8_out ? ctype : otype;
+    const auto ZDtype = _fp8_out ? DType::kBFloat16 : otype;
     _z->set_output(!_fp8_out).set_data_type(get_cudnn_fe_dtype(ZDtype));
 
     if (_fp8_out) {
@@ -340,7 +340,8 @@ CudnnNormalizationPlan::CudnnNormalizationPlan(NVTE_Norm_Type NormType, NVTE_Nor
         _z_scale_inv->set_output(true).set_data_type(get_cudnn_fe_dtype(ctype));
       } else if (_ndim_scale_block == 1) {  // 1d block scaling
         auto z_2d = _graph.reshape(_z, fe::graph::Reshape_attributes());
-        z_2d->set_dim({batch_dim, hidden_dim});
+        z_2d->set_dim({batch_dim, hidden_dim})
+            .set_data_type(get_cudnn_fe_dtype(ZDtype));
 
         auto mx_quantize_row_opts = fe::graph::Block_scale_quantize_attributes()
                                         .set_block_size(32)
