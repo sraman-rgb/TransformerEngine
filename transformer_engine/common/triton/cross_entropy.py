@@ -18,6 +18,7 @@ def cross_entropy_forward_kernel(
     Y_ptr,
     loss_ptr,
     stats_ptr,
+    argmax_ptr,
     n_non_ignore,
     n_cols,
     n_rows_1,
@@ -25,9 +26,11 @@ def cross_entropy_forward_kernel(
     label_smoothing: tl.constexpr,
     COUNT_NON_IGNORE: tl.constexpr,
     COPY_INPUT: tl.constexpr,
+    COMPUTE_ARGMAX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Compute single-rank loss/statistics and optionally preserve the input."""
+    """Compute single-rank loss/statistics and optionally preserve the input and find the
+    argmax of each row."""
 
     row = tl.program_id(0).to(tl.int64)
     row_0 = row // n_rows_1
@@ -43,6 +46,7 @@ def cross_entropy_forward_kernel(
     m = float("-inf")
     d = 0.0
     x_sum = 0.0
+    argmax = 0
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
@@ -50,7 +54,15 @@ def cross_entropy_forward_kernel(
         if COPY_INPUT:
             tl.store(saved_input_ptr + offsets, x, mask=mask)
         x = x.to(tl.float32)
-        block_max = tl.max(x)
+        if COMPUTE_ARGMAX:
+            block_max, block_argmax = tl.max(
+                x, axis=0, return_indices=True, return_indices_tie_break_left=True
+            )
+            # Only a strictly larger maximum replaces an earlier one: first index wins.
+            if block_max > m:
+                argmax = i + block_argmax
+        else:
+            block_max = tl.max(x)
         m_new = tl.maximum(m, block_max)
         d = d * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new))
         m = m_new
@@ -59,6 +71,8 @@ def cross_entropy_forward_kernel(
 
     tl.store(stats_ptr + row * 2, m)
     tl.store(stats_ptr + row * 2 + 1, d)
+    if COMPUTE_ARGMAX:
+        tl.store(argmax_ptr + row, argmax.to(tl.int64))
 
     if y == ignore_idx:
         tl.store(loss_ptr + row, 0.0)
@@ -94,6 +108,8 @@ def cross_entropy_tp_pre_kernel(
     COUNT_NON_IGNORE: tl.constexpr,
     COMPUTE_X_SUM: tl.constexpr,
     COPY_INPUT: tl.constexpr,
+    COMPUTE_ARGMAX: tl.constexpr,
+    LOCAL_DATA_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Compute the local statistics needed by tensor-parallel cross entropy."""
@@ -118,6 +134,7 @@ def cross_entropy_tp_pre_kernel(
     m = float("-inf")
     d = 0.0
     x_sum = 0.0
+    argmax = 0
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
@@ -125,19 +142,30 @@ def cross_entropy_tp_pre_kernel(
         if COPY_INPUT:
             tl.store(saved_input_ptr + offsets, x, mask=mask)
         x = x.to(tl.float32)
-        block_max = tl.max(x)
+        if COMPUTE_ARGMAX:
+            block_max, block_argmax = tl.max(
+                x, axis=0, return_indices=True, return_indices_tie_break_left=True
+            )
+            # Only a strictly larger maximum replaces an earlier one: first index wins.
+            if block_max > m:
+                argmax = i + block_argmax
+        else:
+            block_max = tl.max(x)
         m_new = tl.maximum(m, block_max)
         d = d * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new))
         m = m_new
         if COMPUTE_X_SUM:
             x_sum += tl.sum(tl.where(mask, x, 0.0))
 
-    local_data_ptr += row * 4
+    local_data_ptr += row * LOCAL_DATA_SIZE
     tl.store(local_data_ptr, m)
     tl.store(local_data_ptr + 1, d)
     tl.store(local_data_ptr + 2, x_y)
     if COMPUTE_X_SUM:
         tl.store(local_data_ptr + 3, x_sum)
+    if COMPUTE_ARGMAX:
+        # The local index travels with the FP32 statistics as raw bits.
+        tl.store(local_data_ptr + 4, argmax.to(tl.float32, bitcast=True))
 
 
 @triton.jit
@@ -146,27 +174,39 @@ def cross_entropy_tp_post_kernel(
     Y_ptr,
     loss_ptr,
     stats_ptr,
+    argmax_ptr,
     world_size,
     n_rows,
     n_cols,
     ignore_idx,
     label_smoothing: tl.constexpr,
+    COMPUTE_ARGMAX: tl.constexpr,
+    LOCAL_DATA_SIZE: tl.constexpr,
 ):
     """Combine tensor-parallel statistics and compute loss/global statistics."""
 
     row = tl.program_id(0).to(tl.int64)
-    data_ptr = gathered_data_ptr + row * 4
+    data_ptr = gathered_data_ptr + row * LOCAL_DATA_SIZE
     m = tl.load(data_ptr)
     d = tl.load(data_ptr + 1)
     x_y = tl.load(data_ptr + 2)
     x_sum = 0.0
     if label_smoothing > 0:
         x_sum = tl.load(data_ptr + 3)
+    argmax = 0
+    if COMPUTE_ARGMAX:
+        argmax = tl.load(data_ptr + 4).to(tl.int32, bitcast=True).to(tl.int64)
 
     for rank_idx in range(1, world_size):
-        rank_data_ptr = data_ptr + rank_idx * n_rows * 4
+        rank_data_ptr = data_ptr + rank_idx * n_rows * LOCAL_DATA_SIZE
         m_new = tl.load(rank_data_ptr)
         d_new = tl.load(rank_data_ptr + 1)
+        if COMPUTE_ARGMAX:
+            # Ranks hold consecutive vocabulary shards, so the first rank with the largest
+            # maximum holds the first global maximum.
+            if m_new > m:
+                local_argmax = tl.load(rank_data_ptr + 4).to(tl.int32, bitcast=True)
+                argmax = rank_idx.to(tl.int64) * n_cols + local_argmax.to(tl.int64)
         global_m = tl.maximum(m, m_new)
         d = d * tl.exp(m - global_m) + d_new * tl.exp(m_new - global_m)
         m = global_m
@@ -176,6 +216,8 @@ def cross_entropy_tp_post_kernel(
 
     tl.store(stats_ptr + row * 2, m)
     tl.store(stats_ptr + row * 2 + 1, d)
+    if COMPUTE_ARGMAX:
+        tl.store(argmax_ptr + row, argmax)
 
     y = tl.load(Y_ptr + row)
     if y == ignore_idx:

@@ -430,3 +430,66 @@ def test_parallel_cross_entropy_deprecated_input_alias():
         alias_loss = parallel_cross_entropy(logits, target, _input=logits)
     direct_loss = parallel_cross_entropy(logits, target)
     torch.testing.assert_close(alias_loss, direct_loss)
+
+
+def _logits_with_argmax_cases(shape, dtype):
+    """BF16-representable logits whose rows exercise ties within and across 32K-wide blocks."""
+
+    torch.manual_seed(7)
+    values = torch.randn(shape, dtype=torch.bfloat16, device="cuda").to(dtype)
+    vocab = shape[-1]
+    peak = 8.0
+    values[0, 0, [5, vocab - 30000]] = peak  # equal maxima in different blocks
+    values[0, 1, [vocab - 30000, vocab - 4]] = peak  # equal maxima in later blocks
+    values[0, 2, [100, 7]] = peak  # equal maxima in the same block
+    values[0, 3, vocab - 1] = peak  # a strictly larger maximum in the last block
+    values[0, 4] = 0.5  # a constant row
+    return values
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("reduce_loss", [False, True], ids=["none", "mean"])
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1], ids=["plain", "smoothed"])
+@pytest.mark.parametrize("overwrite_input", [False, True], ids=["safe", "destructive"])
+def test_parallel_cross_entropy_return_argmax(dtype, reduce_loss, label_smoothing, overwrite_input):
+    """The argmax matches torch.argmax, and loss and gradient do not change with it."""
+
+    shape = (2, 5, 70000)
+    values = _logits_with_argmax_cases(shape, dtype)
+    target = torch.randint(0, shape[-1], shape[:-1], device="cuda")
+    target[1, 1] = -100
+    expected_argmax = torch.argmax(values, dim=-1)
+
+    logits = values.clone().requires_grad_()
+    loss = parallel_cross_entropy(
+        logits, target, label_smoothing, reduce_loss, overwrite_input=overwrite_input
+    )
+    argmax_logits = values.clone().requires_grad_()
+    argmax_loss, argmax = parallel_cross_entropy(
+        argmax_logits,
+        target,
+        label_smoothing,
+        reduce_loss,
+        overwrite_input=overwrite_input,
+        return_argmax=True,
+    )
+
+    assert argmax.dtype == torch.int64
+    assert not argmax.requires_grad
+    torch.testing.assert_close(argmax, expected_argmax, rtol=0, atol=0)
+
+    external_grad = torch.randn_like(loss)
+    loss.backward(external_grad)
+    argmax_loss.backward(external_grad)
+    torch.testing.assert_close(argmax_loss, loss, rtol=0, atol=0)
+    torch.testing.assert_close(argmax_logits.grad, logits.grad, rtol=0, atol=0)
+
+
+def test_parallel_cross_entropy_return_argmax_transposed_input():
+    """Each argmax belongs to the row of the loss next to it."""
+
+    values = _logits_with_argmax_cases((2, 5, 70000), torch.float32).transpose(0, 1)
+    target = torch.randint(0, values.shape[-1], values.shape[:-1], device="cuda")
+    loss, argmax = parallel_cross_entropy(values, target, return_argmax=True)
+    assert argmax.shape == loss.shape == values.shape[:-1]
+    torch.testing.assert_close(argmax, torch.argmax(values, dim=-1), rtol=0, atol=0)
