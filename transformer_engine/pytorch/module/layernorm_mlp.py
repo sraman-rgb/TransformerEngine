@@ -21,6 +21,7 @@ from transformer_engine.pytorch.tensor.utils import clear_columnwise_cache, is_c
 from .base import (
     fill_userbuffers_buffer_for_all_gather,
     _ub_communicators,
+    get_dummy_wgrad,
     get_ub,
     get_ub_is_fp8,
     is_ub_initialized,
@@ -2010,6 +2011,12 @@ def _layernorm_mlp_backward_impl(
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
+            elif getattr(fc1_weight_python_object, "zero_tensor_dummy_wgrad", False):
+                fc1_wgrad = get_dummy_wgrad(
+                    list(fc1_weight_main_grad.shape),
+                    fc1_weight_python_object.dtype,
+                    zero_tensor=True,
+                )
             else:
                 fc1_wgrad = torch.empty(
                     fc1_weight_main_grad.shape,
@@ -2034,6 +2041,12 @@ def _layernorm_mlp_backward_impl(
                     dtype=fc2_weight_python_object.dtype,
                     device=torch.cuda.current_device(),
                     requires_grad=False,
+                )
+            elif getattr(fc2_weight_python_object, "zero_tensor_dummy_wgrad", False):
+                fc2_wgrad = get_dummy_wgrad(
+                    list(fc2_weight_main_grad.shape),
+                    fc2_weight_python_object.dtype,
+                    zero_tensor=True,
                 )
             else:
                 fc2_wgrad = torch.empty(

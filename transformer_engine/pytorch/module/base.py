@@ -132,9 +132,19 @@ class UserBufferQuantizationMode(Enum):
     FP8 = "fp8"
 
 
-def get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
-    """Returns a dummy tensor of given shape."""
+def get_dummy_wgrad(
+    shape: list, dtype: torch.dtype, zero: bool = False, zero_tensor: bool = False
+) -> torch.Tensor:
+    """Returns a dummy tensor of given shape.
 
+    With ``zero=True`` the cached dummy is filled with zeros. Otherwise, with
+    ``zero_tensor=True`` the dummy is a ZeroTensor: it has no storage and adding it costs
+    nothing, e.g. when autograd sums the dummy weight gradients of a weight used more than
+    once in one backward pass.
+    """
+
+    if zero_tensor and not zero:
+        return torch._efficientzerotensor(shape, dtype=dtype, device="cuda")
     key = (*shape, dtype)
     global _dummy_wgrads
     if key not in _dummy_wgrads:
