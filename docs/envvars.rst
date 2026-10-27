@@ -433,6 +433,17 @@ LayerNorm/RMSNorm SM Margins
                  BF16 input and normalization-output datatypes. When set to ``0``, or with an
                  earlier cuDNN version, the virtual normalization output uses FP32.
 
+.. envvar:: NVTE_NORM_FWD_MXFP8_USE_TE
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: With ``NVTE_NORM_FWD_USE_CUDNN=1``, run the PyTorch RMSNorm forward with MXFP8
+                 output on Transformer Engine's fused RMSNorm + MXFP8 kernel instead of cuDNN when
+                 the quantizer requests GEMM-swizzled scales (``optimize_for_gemm``, as in
+                 ``LayerNormLinear``). That kernel writes the scales in the GEMM layout, so the
+                 GEMMs consuming the output do not swizzle them again. Other normalizations keep
+                 cuDNN. Has no effect without ``NVTE_NORM_FWD_USE_CUDNN=1``.
+
 .. envvar:: NVTE_FWD_LAYERNORM_SM_MARGIN
 
    :Type: ``int``

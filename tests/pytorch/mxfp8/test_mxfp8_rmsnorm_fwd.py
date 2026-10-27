@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import MXFP8BlockScaling
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import MXFP8Quantizer
 from transformer_engine.pytorch.constants import TE_DType
@@ -130,3 +131,82 @@ def test_rmsnorm_fwd_mxfp8_2d_quantization(dtype):
             rtol=0,
             msg=attr,
         )
+
+
+def _rmsnorm_fwd_mxfp8(x, weight, optimize_for_gemm):
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
+    quantizer.optimize_for_gemm = optimize_for_gemm
+    return tex.rmsnorm_fwd(x, weight, 1e-5, None, quantizer, TE_DType[x.dtype], 0, False)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("shape", [(256, 1024), (384, 7168)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rmsnorm_fwd_mxfp8_use_te_with_cudnn(monkeypatch, shape, dtype):
+    """With NVTE_NORM_FWD_USE_CUDNN=1 and NVTE_NORM_FWD_MXFP8_USE_TE=1, an output with
+    GEMM-swizzled scales comes from Transformer Engine's kernel, byte for byte as without cuDNN;
+    an output with compact scales still comes from cuDNN."""
+    torch.manual_seed(1234)
+    x = torch.randn(*shape, dtype=dtype, device="cuda")
+    weight = torch.randn(shape[1], dtype=dtype, device="cuda")
+
+    monkeypatch.setenv("NVTE_NORM_FWD_MXFP8_USE_TE", "1")
+    monkeypatch.setenv("NVTE_NORM_FWD_USE_CUDNN", "0")
+    ref, _, ref_rsigma = _rmsnorm_fwd_mxfp8(x, weight, optimize_for_gemm=True)
+    monkeypatch.setenv("NVTE_NORM_FWD_USE_CUDNN", "1")
+    out, _, rsigma = _rmsnorm_fwd_mxfp8(x, weight, optimize_for_gemm=True)
+
+    assert out._with_gemm_swizzled_scales
+    torch.testing.assert_close(rsigma, ref_rsigma, atol=0, rtol=0)
+    for attr in (
+        "_rowwise_data",
+        "_columnwise_data",
+        "_rowwise_scale_inv",
+        "_columnwise_scale_inv",
+    ):
+        torch.testing.assert_close(
+            getattr(out, attr).view(torch.uint8),
+            getattr(ref, attr).view(torch.uint8),
+            atol=0,
+            rtol=0,
+            msg=attr,
+        )
+
+    compact, _, _ = _rmsnorm_fwd_mxfp8(x, weight, optimize_for_gemm=False)
+    assert not compact._with_gemm_swizzled_scales
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("in_features,out_features", [(7168, 2112), (1536, 3072)])
+def test_layernorm_linear_mxfp8_use_te_with_cudnn(monkeypatch, in_features, out_features):
+    """LayerNormLinear(RMSNorm) under MXFP8 with NVTE_NORM_FWD_USE_CUDNN=1 and
+    NVTE_NORM_FWD_MXFP8_USE_TE=1 gives the output and gradients of the run without cuDNN.
+    """
+    recipe = MXFP8BlockScaling()
+    torch.manual_seed(1234)
+    module = te.LayerNormLinear(
+        in_features,
+        out_features,
+        bias=False,
+        normalization="RMSNorm",
+        params_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    x = torch.randn(256, in_features, dtype=torch.bfloat16, device="cuda")
+    dy = torch.randn(256, out_features, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        inp = x.clone().requires_grad_()
+        module.zero_grad(set_to_none=True)
+        with te.autocast(enabled=True, recipe=recipe):
+            y = module(inp)
+        y.backward(dy)
+        return [y, inp.grad, module.weight.grad, module.layer_norm_weight.grad]
+
+    monkeypatch.setenv("NVTE_NORM_FWD_MXFP8_USE_TE", "1")
+    monkeypatch.setenv("NVTE_NORM_FWD_USE_CUDNN", "0")
+    ref = run()
+    monkeypatch.setenv("NVTE_NORM_FWD_USE_CUDNN", "1")
+    out = run()
+    for name, a, b in zip(("y", "dx", "dweight", "dgamma"), out, ref):
+        torch.testing.assert_close(a, b, atol=0, rtol=0, msg=name)
