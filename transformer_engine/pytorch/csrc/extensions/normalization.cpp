@@ -353,7 +353,12 @@ std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &w
     // The fused MXFP8 kernels quantize 1D blocks and require full 128x128 tiles
     if (!mxfp8_quantizer_cpp->with_2d_quantization && outer_size % 128 == 0 &&
         inner_size % 128 == 0) {
-      if (transformer_engine::getenv<bool>("NVTE_NORM_FWD_USE_CUDNN")) {
+      // cuDNN's kernel writes compact scales, which each GEMM consuming the output then
+      // swizzles. NVTE_NORM_FWD_MXFP8_USE_TE keeps outputs that request GEMM-swizzled scales
+      // on Transformer Engine's kernel, which writes them directly.
+      const bool swizzled_on_te = mxfp8_quantizer_cpp->optimize_for_gemm &&
+                                  transformer_engine::getenv<bool>("NVTE_NORM_FWD_MXFP8_USE_TE");
+      if (transformer_engine::getenv<bool>("NVTE_NORM_FWD_USE_CUDNN") && !swizzled_on_te) {
         impl = Impl::FUSED_NORM_QUANT_UNSWIZZLED;
       } else {
         // Transformer Engine's fused RMSNorm + MXFP8 kernel
