@@ -6,12 +6,17 @@
 from __future__ import annotations
 
 import atexit
+import functools
+import logging
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 
 import transformer_engine_torch as tex
 
@@ -593,6 +598,732 @@ def _ep_combine_raw(buffer: "EpBuffer", expert_out: torch.Tensor, result: torch.
     tex.ep_combine(buffer.handle_mem, expert_out, result)
 
 
+# NVFP4 token packing for EP dispatch
+
+
+# One packed row per token: [H/2 bytes of E2M1 pairs | H/16 E4M3 block scales | FP32 token
+# scale], zero-padded to 16 bytes. Elements use the standard NVFP4 layout (E2M1 values, one E4M3
+# scale per 16 elements); the second-level FP32 scale is per token instead of per tensor, so
+# every token decodes on its own and the receiver needs no cross-rank scale agreement.
+_NVFP4_TILE = 512  # elements per kernel tile: 32 blocks of 16
+# Return the NVFP4 GroupedTensor built straight from the packed rows instead of BF16 recv tokens.
+_NVFP4_FUSED_RECEIVE = os.environ.get("NVTE_EP_NVFP4_FUSED_RECEIVE", "0") == "1"
+# Build that GroupedTensor with the CUDA direct receive: the rowwise operand reuses the sender's
+# E2M1 codes (power-of-two token scales), the columnwise RHT operand is quantized in one pass.
+_NVFP4_DIRECT_RECEIVE = os.environ.get("NVTE_EP_NVFP4_DIRECT_RECEIVE", "0") == "1"
+# NVFP4 combine backward with the direct receive: the sender packs the result-grad with stochastic
+# rounding and power-of-two token scales (CUDA pack), the receiver builds FC2's grad_output NVFP4
+# GroupedTensor (rowwise codes reused, columnwise RHT quantized with stochastic rounding).
+_NVFP4_DIRECT_CBWD = os.environ.get("NVTE_EP_NVFP4_DIRECT_CBWD", "0") == "1"
+_NVFP4_TILE_BLOCKS = 32
+_NVFP4_BLOCK = 16
+_E2M1_MAX = 6.0
+_E4M3_MAX = 448.0
+
+
+_NVFP4_RECEIVE_PATHS_LOGGED = set()
+
+
+def _log_nvfp4_receive_path_once(fused: bool) -> None:
+    """Log once per process which NVFP4 receive path runs (fused GroupedTensor or BF16 decode)."""
+    if not (_NVFP4_FUSED_RECEIVE or _NVFP4_DIRECT_RECEIVE) or fused in _NVFP4_RECEIVE_PATHS_LOGGED:
+        return
+    _NVFP4_RECEIVE_PATHS_LOGGED.add(fused)
+    kind = "direct" if _NVFP4_DIRECT_RECEIVE else "fused"
+    path = f"{kind} NVFP4 GroupedTensor" if fused else "BF16 decode (NVFP4 compute inactive)"
+    # Logged rather than warned: training jobs commonly filter UserWarnings.
+    logging.getLogger(__name__).warning("NVFP4 EP dispatch receive path: %s", path)
+
+
+_NVFP4_CBWD_PATH_LOGGED = []
+
+
+def _log_nvfp4_cbwd_path_once() -> None:
+    """Log once per process that the NVFP4 combine backward uses the direct receive."""
+    if _NVFP4_CBWD_PATH_LOGGED:
+        return
+    _NVFP4_CBWD_PATH_LOGGED.append(True)
+    logging.getLogger(__name__).warning(
+        "NVFP4 EP combine backward path: direct NVFP4 GroupedTensor (stochastic rounding)"
+    )
+
+
+def _nvfp4_compute_active() -> bool:
+    """Whether the expert GEMMs will run in NVFP4, so they can consume the fused-receive
+    GroupedTensor. Outside NVFP4 autocast (e.g. BF16 evaluation) the receiver decodes to BF16."""
+    from .quantization import FP8GlobalStateManager
+
+    if not FP8GlobalStateManager.is_fp8_enabled():
+        return False
+    return FP8GlobalStateManager.get_fp8_recipe().nvfp4()
+
+
+def _nvfp4_fast_math() -> bool:
+    """Whether TE's NVFP4 casts use the approximate reciprocal (NVTE_USE_FAST_MATH)."""
+    return os.environ.get("NVTE_USE_FAST_MATH", "0") == "1"
+
+
+def _nvfp4_row_bytes(hidden: int) -> int:
+    """Bytes of one packed NVFP4 token row, padded to the 16-byte EP row alignment."""
+    raw = hidden // 2 + hidden // _NVFP4_BLOCK + 4
+    return (raw + 15) // 16 * 16
+
+
+def _is_nvfp4_recipe(recipe) -> bool:
+    if recipe is None:
+        return False
+    from ..common.recipe import NVFP4BlockScaling
+
+    return isinstance(recipe, NVFP4BlockScaling)
+
+
+@triton.jit
+def _nvfp4_reciprocal(x, FAST_MATH: tl.constexpr):
+    """1 / x as TE's NVFP4 cast computes it: rcp.approx.ftz under NVTE_USE_FAST_MATH, else IEEE
+    division; capped at FLT_MAX like TE (x == 0 gives FLT_MAX)."""
+    if FAST_MATH:
+        r = tl.inline_asm_elementwise(
+            "rcp.approx.ftz.f32 $0, $1;", "=f,f", [x], dtype=tl.float32, is_pure=True, pack=1
+        )
+    else:
+        r = tl.div_rn(tl.full(x.shape, 1.0, tl.float32), x)
+    return tl.minimum(r, 3.4028234663852886e38)
+
+
+@triton.jit
+def _e2m1_encode(v):
+    """Round to the nearest E2M1 value (ties to even) and return the 4-bit code."""
+    a = tl.abs(v)
+    code = tl.where(
+        a <= 0.25,
+        0,
+        tl.where(
+            a < 0.75,
+            1,
+            tl.where(
+                a <= 1.25,
+                2,
+                tl.where(
+                    a < 1.75,
+                    3,
+                    tl.where(a <= 2.5, 4, tl.where(a < 3.5, 5, tl.where(a <= 5.0, 6, 7))),
+                ),
+            ),
+        ),
+    )
+    # Sign from the float sign bit, so -0.0 encodes as -0 like the hardware conversion.
+    return code + tl.where(v.to(tl.int32, bitcast=True) < 0, 8, 0)
+
+
+@triton.jit
+def _e2m1_decode(code):
+    """Value of a 4-bit E2M1 code."""
+    m = code & 7
+    mag = tl.where(
+        m == 0,
+        0.0,
+        tl.where(
+            m == 1,
+            0.5,
+            tl.where(
+                m == 2,
+                1.0,
+                tl.where(
+                    m == 3,
+                    1.5,
+                    tl.where(m == 4, 2.0, tl.where(m == 5, 3.0, tl.where(m == 6, 4.0, 6.0))),
+                ),
+            ),
+        ),
+    )
+    return tl.where((code & 8) != 0, -mag, mag)
+
+
+@triton.jit
+def _e2m1_sr_code(v, u):
+    """Stochastically round to an E2M1 value (saturating at 6) with uniform ``u`` in [0, 1) and
+    return the 4-bit code: rounds up to the next grid point with probability equal to the
+    fractional distance, so the rounding is unbiased."""
+    a = tl.minimum(tl.abs(v), 6.0)
+    lo = tl.where(a < 2.0, tl.floor(a * 2.0) * 0.5, tl.where(a < 4.0, tl.floor(a), 4.0))
+    step = tl.where(a < 2.0, 0.5, tl.where(a < 4.0, 1.0, 2.0))
+    r = tl.minimum(tl.where(u * step < a - lo, lo + step, lo), 6.0)
+    code = tl.where(
+        r < 2.0, (r * 2.0).to(tl.int32), tl.where(r < 4.0, r.to(tl.int32) + 2, tl.where(r < 6.0, 6, 7))
+    )
+    return code + tl.where(v.to(tl.int32, bitcast=True) < 0, 8, 0)
+
+
+@triton.jit
+def _nvfp4_pack_kernel(
+    x_ptr,
+    out_ptr,
+    H: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    FAST_MATH: tl.constexpr,
+    seed_ptr,
+    STOCHASTIC: tl.constexpr,
+    POW2: tl.constexpr = False,
+):
+    row = tl.program_id(0).to(tl.int64)
+    x_row = x_ptr + row * H
+    out_row = out_ptr + row * ROW_BYTES
+    blk = tl.arange(0, 32)[:, None]
+    pair = tl.arange(0, 8)[None, :]
+    elem = blk * 16 + 2 * pair
+
+    amax = tl.zeros([32, 8], dtype=tl.float32)
+    for t in range(NUM_TILES):
+        xe = tl.load(x_row + t * 512 + elem).to(tl.float32)
+        xo = tl.load(x_row + t * 512 + elem + 1).to(tl.float32)
+        amax = tl.maximum(amax, tl.maximum(tl.abs(xe), tl.abs(xo)))
+    row_amax = tl.max(tl.max(amax, axis=1), axis=0)
+    # Same arithmetic as TE's row-scaled NVFP4 quantizer (core_nvfp4.cuh), so the codes and
+    # scales match it bit for bit.
+    if POW2:
+        # Power-of-two token scale: the smallest 2^e >= amax / (6 * 448). The direct receive
+        # re-expresses block scales against a per-expert power of two, which is then exact.
+        ratio_bits = tl.div_rn(row_amax, 448.0 * 6.0).to(tl.int32, bitcast=True)
+        exp_bits = ratio_bits & 0x7F800000
+        dec_bits = tl.where((ratio_bits & 0x7FFFFF) == 0, exp_bits, exp_bits + 0x800000)
+        dec_bits = tl.maximum(dec_bits, 0x800000)
+        global_decode = tl.where(row_amax == 0.0, 0.0, dec_bits.to(tl.float32, bitcast=True))
+        global_encode = tl.where(row_amax == 0.0, 1.0, tl.div_rn(1.0, global_decode))
+    else:
+        global_encode = tl.minimum(tl.div_rn(448.0 * 6.0, row_amax), 3.4028234663852886e38)
+        global_encode = tl.where((row_amax == 0.0) | (global_encode == 0.0), 1.0, global_encode)
+        global_decode = tl.div_rn(1.0, global_encode)
+    tl.store((out_row + H // 2 + H // 16).to(tl.pointer_type(tl.float32)), global_decode)
+
+    for t in range(NUM_TILES):
+        xe = tl.load(x_row + t * 512 + elem).to(tl.float32)
+        xo = tl.load(x_row + t * 512 + elem + 1).to(tl.float32)
+        block_amax = tl.max(tl.maximum(tl.abs(xe), tl.abs(xo)), axis=1)
+        block_scale = tl.minimum(block_amax * (global_encode * (1.0 / 6.0)), 448.0)
+        block_scale = block_scale.to(tl.float8e4nv)
+        tl.store(
+            out_row + H // 2 + t * 32 + tl.arange(0, 32), block_scale.to(tl.uint8, bitcast=True)
+        )
+        denom = block_scale.to(tl.float32) * global_decode
+        rcp = _nvfp4_reciprocal(denom, FAST_MATH)[:, None]
+        if STOCHASTIC:
+            seed = tl.load(seed_ptr)
+            offs = (row * H + t * 512 + elem).to(tl.int32)
+            code_e = _e2m1_sr_code(xe * rcp, tl.rand(seed, offs))
+            code_o = _e2m1_sr_code(xo * rcp, tl.rand(seed, offs + 1))
+            packed = code_e | (code_o << 4)
+        else:
+            packed = _e2m1x2_cvt(xe * rcp, xo * rcp)
+        tl.store(out_row + t * 256 + blk * 8 + pair, packed.to(tl.uint8))
+
+
+@triton.jit
+def _nvfp4_unpack_kernel(
+    in_ptr,
+    out_ptr,
+    counts_ptr,
+    num_rows,
+    NUM_COUNTS: tl.constexpr,
+    COUNTS_P2: tl.constexpr,
+    H: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    TM: tl.constexpr,
+    TK: tl.constexpr,
+    NPROG: tl.constexpr,
+):
+    bound = num_rows
+    if NUM_COUNTS > 0:
+        idx = tl.arange(0, COUNTS_P2)
+        counts = tl.load(counts_ptr + idx, mask=idx < NUM_COUNTS, other=0)
+        bound = tl.minimum(tl.sum(counts).to(tl.int32), num_rows)
+    num_tiles = tl.cdiv(bound, TM) * (H // TK)
+    for t in range(tl.program_id(0), num_tiles, NPROG):
+        r = (t // (H // TK)) * TM + tl.arange(0, TM)
+        c = (t % (H // TK)) * TK + tl.arange(0, TK)[None, :]
+        mask = (r < bound)[:, None]
+        row = in_ptr + r.to(tl.int64)[:, None] * ROW_BYTES
+        code = (tl.load(row + c // 2, mask=mask, other=0).to(tl.int32) >> (4 * (c % 2))) & 15
+        sb = tl.load(row + H // 2 + c // 16, mask=mask, other=0)
+        token_scale = tl.load(
+            (row + H // 2 + H // 16).to(tl.pointer_type(tl.float32)), mask=mask, other=0.0
+        )
+        scale = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32) * token_scale
+        out = _e2m1_decode_bits(code) * scale
+        tl.store(out_ptr + r.to(tl.int64)[:, None] * H + c, out.to(tl.bfloat16), mask=mask)
+
+
+def _nvfp4_pack_tokens(
+    tokens: torch.Tensor,
+    stochastic: bool = False,
+    seed: Optional[torch.Tensor] = None,
+    pow2_scale: bool = False,
+) -> torch.Tensor:
+    """Quantize BF16 tokens [T, H] to packed NVFP4 rows, returned as uint8 [T, row_bytes].
+
+    ``stochastic`` rounds the E2M1 values stochastically (for gradients, as the NVFP4 recipe's
+    grad quantizer does). The Philox seed is a device tensor (``seed``, int64 [1]); by default it
+    is drawn from torch's CUDA generator per call, which is CUDA-graph safe, so every replay draws
+    fresh bits. ``pow2_scale`` rounds each token's decode scale up to a power of two (needed by
+    the direct receive); zero tokens then carry a zero decode scale."""
+    tokens = tokens.contiguous()
+    num_tokens, hidden = tokens.shape
+    if hidden % _NVFP4_TILE != 0:
+        raise ValueError(f"NVFP4 EP dispatch requires hidden % {_NVFP4_TILE} == 0, got {hidden}.")
+    row_bytes = _nvfp4_row_bytes(hidden)
+    packed = torch.zeros(num_tokens, row_bytes, dtype=torch.uint8, device=tokens.device)
+    if stochastic and seed is None:
+        seed = torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64, device=tokens.device)
+    if num_tokens > 0:
+        _nvfp4_pack_kernel[(num_tokens,)](
+            tokens,
+            packed,
+            H=hidden,
+            ROW_BYTES=row_bytes,
+            NUM_TILES=hidden // _NVFP4_TILE,
+            FAST_MATH=_nvfp4_fast_math(),
+            seed_ptr=seed if seed is not None else packed,
+            STOCHASTIC=stochastic,
+            POW2=pow2_scale,
+        )
+    return packed
+
+
+def _nvfp4_unpack_tokens(
+    packed: torch.Tensor,
+    hidden: int,
+    counts: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Dequantize packed NVFP4 rows (uint8 [R, row_bytes]) to BF16 [R, H]. With ``counts`` only
+    the first ``sum(counts)`` rows are decoded, read on device so CUDA graph replays see the live
+    count; later rows are left untouched, as a BF16 dispatch leaves them."""
+    num_rows = packed.shape[0]
+    row_bytes = _nvfp4_row_bytes(hidden)
+    if packed.shape[1] != row_bytes:
+        raise ValueError(f"packed NVFP4 rows must be {row_bytes} bytes, got {packed.shape[1]}.")
+    if out is None:
+        out = torch.empty(num_rows, hidden, dtype=torch.bfloat16, device=packed.device)
+    num_counts = 0 if counts is None else counts.numel()
+    if num_rows > 0:
+        nprog = _nvfp4_num_programs(packed.device.index)
+        _nvfp4_unpack_kernel[(nprog,)](
+            packed,
+            out,
+            packed if counts is None else counts,
+            num_rows,
+            NUM_COUNTS=num_counts,
+            COUNTS_P2=max(1, triton.next_power_of_2(max(num_counts, 1))),
+            H=hidden,
+            ROW_BYTES=row_bytes,
+            TM=32,
+            TK=256,
+            NPROG=nprog,
+            num_warps=4,
+        )
+    return out
+
+
+# NVFP4 fused receive: packed rows -> the NVFP4 GroupedTensor the fused grouped MLP consumes
+
+
+# Tile of the fused receive: 128 tokens (8 RHT blocks of 16) x 64 hidden (4 scale blocks of 16).
+# Experts are 256-token aligned for the fused grouped MLP, so a tile never crosses an expert.
+_FUSED_TILE_M = 128
+_FUSED_TILE_K = 64
+
+
+@triton.jit
+def _e2m1_decode_bits(code):
+    """FP32 value of 4-bit E2M1 codes via BF16 bit assembly (exact; -0 stays -0)."""
+    m = code & 1
+    e = (code >> 1) & 3
+    bits = tl.where(e == 0, m * 0x3F00, ((e + 126) << 7) | (m << 6)) | ((code & 8) << 12)
+    return bits.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _e2m1x2_cvt(lo, hi):
+    """Pack two FP32 tensors into E2M1 pairs (low nibble = lo) with the hardware RN-satfinite
+    conversion TE's casts use."""
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t; }",
+        "=r,f,f",
+        [lo, hi],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _nvfp4_recv_tile(in_row, c0, H: tl.constexpr):
+    """Decode a [128, 64] tile of packed rows (pointers ``in_row`` [128]) at hidden offset ``c0``
+    to FP32 values rounded through BF16, exactly as the BF16 decode path stores them."""
+    pair = tl.arange(0, 32)[None, :]
+    packed = tl.load(in_row[:, None] + c0 // 2 + pair).to(tl.int32)
+    vals = tl.reshape(
+        tl.join(_e2m1_decode_bits(packed & 15), _e2m1_decode_bits(packed >> 4)), (128, 64)
+    )
+    sb = tl.load(in_row[:, None] + H // 2 + c0 // 16 + tl.arange(0, 4)[None, :])
+    token_scale = tl.load((in_row + H // 2 + H // 16).to(tl.pointer_type(tl.float32)))
+    scale = sb.to(tl.float8e4nv, bitcast=True).to(tl.float32) * token_scale[:, None]
+    vals = tl.reshape(tl.reshape(vals, (128, 4, 16)) * scale[:, :, None], (128, 64))
+    return vals.to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _nvfp4_counts(counts_ptr, NUM_GROUPS: tl.constexpr, GROUPS_P2: tl.constexpr):
+    idx = tl.arange(0, GROUPS_P2)
+    counts = tl.load(counts_ptr + idx, mask=idx < NUM_GROUPS, other=0).to(tl.int32)
+    return idx, counts, tl.cumsum(counts, axis=0)
+
+
+@triton.jit
+def _nvfp4_group_of_row(idx, counts, ends, r0):
+    """(group, group row offset, group rows) of the row r0 (groups are tile aligned)."""
+    g = tl.sum((ends <= r0).to(tl.int32))
+    g_end = tl.sum(tl.where(idx == g, ends, 0))
+    g_rows = tl.sum(tl.where(idx == g, counts, 0))
+    return g, g_end - g_rows, g_rows
+
+
+@triton.jit
+def _nvfp4_rht_tile(vals, bd, ROUND_BF16: tl.constexpr):
+    """RHT along tokens of a [128, 64] tile as one block-diagonal [128, 128] x [128, 64] GEMM
+    (``bd`` = I_8 (x) H^T in BF16, FP32 accumulate). TE rounds the result to BF16 except under
+    NVTE_USE_FAST_MATH, where it quantizes the FP32 accumulator."""
+    y = tl.dot(bd, vals.to(tl.bfloat16))
+    if ROUND_BF16:
+        y = y.to(tl.bfloat16).to(tl.float32)
+    return y
+
+
+@triton.jit
+def _nvfp4_load_block_diag(bd_ptr):
+    i = tl.arange(0, 128)
+    return tl.load(bd_ptr + i[:, None] * 128 + i[None, :])
+
+
+@triton.jit
+def _nvfp4_recv_amax_kernel(
+    in_ptr,
+    counts_ptr,
+    bd_ptr,
+    row_amax_ptr,
+    col_amax_ptr,
+    NUM_GROUPS: tl.constexpr,
+    GROUPS_P2: tl.constexpr,
+    H: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    NPROG: tl.constexpr,
+):
+    idx, counts, ends = _nvfp4_counts(counts_ptr, NUM_GROUPS, GROUPS_P2)
+    num_tiles = tl.cdiv(tl.sum(counts), 128) * (H // 64)
+    bd = _nvfp4_load_block_diag(bd_ptr)
+    for t in range(tl.program_id(0), num_tiles, NPROG):
+        r0 = (t // (H // 64)) * 128
+        c0 = (t % (H // 64)) * 64
+        g, g_off, g_rows = _nvfp4_group_of_row(idx, counts, ends, r0)
+        rows = (r0 + tl.arange(0, 128)).to(tl.int64)
+        vals = _nvfp4_recv_tile(in_ptr + rows * ROW_BYTES, c0, H)
+        tl.atomic_max(row_amax_ptr + g, tl.max(tl.max(tl.abs(vals), axis=1), axis=0))
+        y = _nvfp4_rht_tile(vals, bd, True)
+        tl.atomic_max(col_amax_ptr + g, tl.max(tl.max(tl.abs(y), axis=1), axis=0))
+
+
+@triton.jit
+def _nvfp4_global_encode(amax):
+    enc = tl.minimum(tl.div_rn(448.0 * 6.0, amax), 3.4028234663852886e38)
+    return tl.where((amax == 0.0) | (enc == 0.0), 1.0, enc)
+
+
+@triton.jit
+def _nvfp4_swizzled_scale_offset(r, c, num_scale_cols):
+    """Offset of scale (row r, scale col c) in the GEMM-swizzled 128x4 tile layout."""
+    return (
+        ((r // 128) * ((num_scale_cols + 3) // 4) + c // 4) * 512
+        + (r % 32) * 16
+        + ((r // 32) % 4) * 4
+        + (c % 4)
+    )
+
+
+@triton.jit
+def _nvfp4_recv_encode_kernel(
+    in_ptr,
+    counts_ptr,
+    bd_ptr,
+    row_amax_ptr,
+    col_amax_ptr,
+    row_data_ptr,
+    row_scale_ptr,
+    col_data_ptr,
+    col_scale_ptr,
+    NUM_GROUPS: tl.constexpr,
+    GROUPS_P2: tl.constexpr,
+    H: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    FAST_MATH: tl.constexpr,
+    NPROG: tl.constexpr,
+):
+    idx, counts, ends = _nvfp4_counts(counts_ptr, NUM_GROUPS, GROUPS_P2)
+    num_tiles = tl.cdiv(tl.sum(counts), 128) * (H // 64)
+    bd = _nvfp4_load_block_diag(bd_ptr)
+    for t in range(tl.program_id(0), num_tiles, NPROG):
+        r0 = (t // (H // 64)) * 128
+        c0 = (t % (H // 64)) * 64
+        g, g_off, g_rows = _nvfp4_group_of_row(idx, counts, ends, r0)
+        rows = (r0 + tl.arange(0, 128)).to(tl.int64)
+        vals = _nvfp4_recv_tile(in_ptr + rows * ROW_BYTES, c0, H)
+
+        # Rowwise: 16-element blocks along hidden, group second-level scale.
+        enc = _nvfp4_global_encode(tl.load(row_amax_ptr + g))
+        dec = tl.div_rn(1.0, enc)
+        v = tl.reshape(vals, (128, 4, 16))
+        bmax = tl.max(tl.abs(v), axis=2)
+        sb = tl.minimum(bmax * (enc * (1.0 / 6.0)), 448.0).to(tl.float8e4nv)
+        rcp = _nvfp4_reciprocal(sb.to(tl.float32) * dec, FAST_MATH)
+        q_lo, q_hi = tl.split(tl.reshape(v * rcp[:, :, None], (128, 32, 2)))
+        pair = tl.arange(0, 32)[None, :]
+        tl.store(
+            row_data_ptr + rows[:, None] * (H // 2) + c0 // 2 + pair,
+            _e2m1x2_cvt(q_lo, q_hi).to(tl.uint8),
+        )
+        sc = c0 // 16 + tl.arange(0, 4)[None, :]
+        tl.store(
+            row_scale_ptr + _nvfp4_swizzled_scale_offset(rows[:, None], sc, H // 16),
+            sb.to(tl.uint8, bitcast=True),
+        )
+
+        # Columnwise: RHT along tokens, 16-token blocks, group post-RHT second-level scale.
+        # Per-group layout: data [H, g_rows / 2], scales [H, g_rows / 16] (swizzled, per group).
+        enc_c = _nvfp4_global_encode(tl.load(col_amax_ptr + g))
+        dec_c = tl.div_rn(1.0, enc_c)
+        y = tl.reshape(_nvfp4_rht_tile(vals, bd, not FAST_MATH), (8, 16, 64))
+        bmax_c = tl.max(tl.abs(y), axis=1)  # [8 token blocks, 64 hidden]
+        sb_c = tl.minimum(bmax_c * (enc_c * (1.0 / 6.0)), 448.0).to(tl.float8e4nv)
+        rcp_c = _nvfp4_reciprocal(sb_c.to(tl.float32) * dec_c, FAST_MATH)
+        qc = tl.reshape(tl.permute(y * rcp_c[:, None, :], (2, 0, 1)), (64, 64, 2))
+        qc_lo, qc_hi = tl.split(qc)  # [hidden, token pairs]
+        k = c0 + tl.arange(0, 64)
+        local = r0 - g_off
+        g_off64 = g_off.to(tl.int64)
+        tok_pair = local // 2 + tl.arange(0, 64)[None, :]
+        tl.store(
+            col_data_ptr + g_off64 * (H // 2) + k[:, None].to(tl.int64) * (g_rows // 2) + tok_pair,
+            _e2m1x2_cvt(qc_lo, qc_hi).to(tl.uint8),
+        )
+        blk = local // 16 + tl.arange(0, 8)[:, None]
+        tl.store(
+            col_scale_ptr
+            + g_off64 * (H // 16)
+            + _nvfp4_swizzled_scale_offset(k[None, :], blk, g_rows // 16),
+            sb_c.to(tl.uint8, bitcast=True),
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _nvfp4_rht_block_diag(device: torch.device) -> torch.Tensor:
+    """I_8 (x) H^T in BF16: the 16x16 RHT applied to each 16-token block of a 128-token tile."""
+    from .tensor.nvfp4_tensor import get_rht_matrix
+
+    rht_t = get_rht_matrix(True, device.index).t().float()
+    return torch.block_diag(*([rht_t] * 8)).to(torch.bfloat16).contiguous()
+
+
+@functools.lru_cache(maxsize=None)
+def _nvfp4_num_programs(device_index: int) -> int:
+    return 4 * torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _nvfp4_fused_receive(
+    recv_packed: torch.Tensor,
+    hidden: int,
+    counts: torch.Tensor,
+    fake_dtype: torch.dtype = torch.bfloat16,
+):
+    """Build the NVFP4 GroupedTensor the fused grouped MLP consumes (rowwise data + swizzled
+    scales + per-group amax; columnwise RHT data + swizzled scales + per-group post-RHT amax)
+    straight from packed NVFP4 rows. Matches ``group_quantize`` of the decoded BF16 rows up to
+    rounding ties, without materializing them. Bounded on device by ``counts`` (CUDA-graph safe).
+    """
+    from .tensor.grouped_tensor import GroupedTensor
+    from .tensor.nvfp4_tensor import NVFP4Quantizer
+
+    capacity = recv_packed.shape[0]
+    if capacity % _FUSED_TILE_M != 0 or hidden % _NVFP4_TILE != 0:
+        raise ValueError(
+            f"NVFP4 fused receive needs capacity % {_FUSED_TILE_M} == 0 and hidden % "
+            f"{_NVFP4_TILE} == 0, got capacity={capacity}, hidden={hidden}."
+        )
+    device = recv_packed.device
+    num_groups = counts.numel()
+    block_diag = _nvfp4_rht_block_diag(device)
+    row_amax = torch.zeros(num_groups, dtype=torch.float32, device=device)
+    col_amax = torch.zeros(num_groups, dtype=torch.float32, device=device)
+    # Rows past sum(counts) are never read by the grouped GEMMs, so no zero fill.
+    row_data = torch.empty(capacity * hidden // 2, dtype=torch.uint8, device=device)
+    row_scale = torch.empty(capacity * hidden // 16, dtype=torch.uint8, device=device)
+    col_data = torch.empty(capacity * hidden // 2, dtype=torch.uint8, device=device)
+    col_scale = torch.empty(capacity * hidden // 16, dtype=torch.uint8, device=device)
+    nprog = 2 * torch.cuda.get_device_properties(device.index).multi_processor_count
+    num_warps = 8
+    meta = dict(
+        NUM_GROUPS=num_groups,
+        GROUPS_P2=triton.next_power_of_2(max(num_groups, 1)),
+        H=hidden,
+        ROW_BYTES=_nvfp4_row_bytes(hidden),
+        NPROG=nprog,
+    )
+    _nvfp4_recv_amax_kernel[(nprog,)](
+        recv_packed, counts, block_diag, row_amax, col_amax, num_warps=num_warps, **meta
+    )
+    _nvfp4_recv_encode_kernel[(nprog,)](
+        recv_packed,
+        counts,
+        block_diag,
+        row_amax,
+        col_amax,
+        row_data,
+        row_scale,
+        col_data,
+        col_scale,
+        FAST_MATH=_nvfp4_fast_math(),
+        num_warps=num_warps,
+        **meta,
+    )
+    quantizer = NVFP4Quantizer(
+        rowwise=True, columnwise=True, with_rht=True, with_post_rht_amax=True
+    )
+    quantizer.optimize_for_gemm = True
+    quantizer.internal = True
+    return GroupedTensor(
+        shape=(capacity, hidden),
+        dtype=fake_dtype,
+        num_tensors=num_groups,
+        quantizer=quantizer,
+        data=row_data,
+        columnwise_data=col_data,
+        scale_inv=row_scale,
+        columnwise_scale_inv=col_scale,
+        amax=row_amax,
+        columnwise_amax=col_amax,
+        first_dims=counts,
+        tensor_offsets=tex.splits_to_offsets(counts, hidden),
+        with_gemm_swizzled_scales=True,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _nvfp4_rht_sign_mask() -> int:
+    """Bitmask of TE's wgrad RHT random signs (bit i set: sign i is -1), computed on the host."""
+    from .tensor.nvfp4_tensor import get_sign_from_vector, get_wgrad_sign_vector
+
+    return int(get_sign_from_vector(get_wgrad_sign_vector("cpu")))
+
+
+@functools.lru_cache(maxsize=None)
+def _nvfp4_direct_ext():
+    """The prebuilt direct-receive CUDA extension (mounted next to this module)."""
+    import importlib.util
+
+    path = os.environ.get(
+        "NVTE_EP_NVFP4_DIRECT_EXT",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "_nvfp4_direct_ext.so"),
+    )
+    spec = importlib.util.spec_from_file_location("_nvfp4_direct_ext", path)
+    if spec is None:
+        raise RuntimeError(f"NVFP4 direct receive extension not found at {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _nvfp4_pack_tokens_cuda(tokens: torch.Tensor, stochastic: bool) -> torch.Tensor:
+    """CUDA pack with power-of-two token scales (``_nvfp4_pack_tokens(pow2_scale=True)`` layout);
+    stochastic rounding uses Philox bits from a per-call device seed (CUDA-graph safe)."""
+    tokens = tokens.contiguous()
+    num_tokens, hidden = tokens.shape
+    packed = torch.empty(
+        num_tokens, _nvfp4_row_bytes(hidden), dtype=torch.uint8, device=tokens.device
+    )
+    seed = None
+    if stochastic:
+        seed = torch.randint(0, 2**62, (1,), dtype=torch.int64, device=tokens.device)
+    _nvfp4_direct_ext().pack_tokens(tokens, packed, _nvfp4_fast_math(), seed)
+    return packed
+
+
+def _nvfp4_direct_receive(
+    recv_packed: torch.Tensor,
+    hidden: int,
+    counts: torch.Tensor,
+    fake_dtype: torch.dtype = torch.bfloat16,
+    stochastic: bool = False,
+):
+    """Like ``_nvfp4_fused_receive`` but in one CUDA pass and without requantizing the rowwise
+    operand. Needs rows packed with ``pow2_scale=True``. Second-level scales are per expert:
+    rowwise ``6 * 448 * G`` and columnwise ``4 * 6 * 448 * G`` with ``G`` the largest token scale
+    of the expert (an upper bound of the post-RHT amax, so no amax pass is needed)."""
+    from .tensor.grouped_tensor import GroupedTensor
+    from .tensor.nvfp4_tensor import NVFP4Quantizer
+
+    capacity = recv_packed.shape[0]
+    device = recv_packed.device
+    num_groups = counts.numel()
+    counts = counts.to(torch.int64)
+    row_data = torch.empty(capacity * hidden // 2, dtype=torch.uint8, device=device)
+    row_scale = torch.empty(capacity * hidden // 16, dtype=torch.uint8, device=device)
+    col_data = torch.empty(capacity * hidden // 2, dtype=torch.uint8, device=device)
+    col_scale = torch.empty(capacity * hidden // 16, dtype=torch.uint8, device=device)
+    row_amax = torch.empty(num_groups, dtype=torch.float32, device=device)
+    col_amax = torch.empty(num_groups, dtype=torch.float32, device=device)
+    gmax = torch.empty(num_groups, dtype=torch.int32, device=device)
+    seed = None
+    if stochastic:
+        seed = torch.randint(0, 2**62, (1,), dtype=torch.int64, device=device)
+    _nvfp4_direct_ext().direct_receive(
+        recv_packed,
+        counts,
+        hidden,
+        gmax,
+        _nvfp4_rht_sign_mask(),
+        row_data,
+        row_scale,
+        col_data,
+        col_scale,
+        row_amax,
+        col_amax,
+        _nvfp4_fast_math(),
+        seed,
+    )
+    quantizer = NVFP4Quantizer(
+        rowwise=True,
+        columnwise=True,
+        with_rht=True,
+        with_post_rht_amax=True,
+        stochastic_rounding=stochastic,
+    )
+    quantizer.optimize_for_gemm = True
+    quantizer.internal = True
+    return GroupedTensor(
+        shape=(capacity, hidden),
+        dtype=fake_dtype,
+        num_tensors=num_groups,
+        quantizer=quantizer,
+        data=row_data,
+        columnwise_data=col_data,
+        scale_inv=row_scale,
+        columnwise_scale_inv=col_scale,
+        amax=row_amax,
+        columnwise_amax=col_amax,
+        first_dims=counts,
+        tensor_offsets=tex.splits_to_offsets(counts, hidden),
+        with_gemm_swizzled_scales=True,
+    )
+
+
 # autograd.Function wrappers
 
 
@@ -627,6 +1358,10 @@ def _ep_prepare_and_dispatch_fwd(
     output (a per-expert GroupedTensor for MXFP8, else the raw recv tokens), the recv topk weights,
     and a _DispatchState for backward. No autograd; the caller owns context handling."""
     _require_bf16("dispatch input", tokens)
+    if _is_nvfp4_recipe(buffer.dispatch_fwd_quant_recipe):
+        return _ep_prepare_and_dispatch_nvfp4_fwd(
+            tokens, topk_weights, topk_idx, buffer, recv_tokens, recv_topk_weights
+        )
     tokens_scale_inv = None
     if buffer.dispatch_fwd_quant_recipe is not None:
         from .tensor.mxfp8_tensor import MXFP8Quantizer
@@ -730,6 +1465,102 @@ def _ep_prepare_and_dispatch_fwd(
         )
         return recv_out, recv_topk_weights, state
     return recv_tokens, recv_topk_weights, state
+
+
+def _ep_prepare_and_dispatch_nvfp4_fwd(
+    tokens: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_idx: torch.Tensor,
+    buffer: "EpBuffer",
+    recv_tokens: Optional[torch.Tensor],
+    recv_topk_weights: Optional[torch.Tensor],
+):
+    """NVFP4 dispatch: pack each token to an NVFP4 row, move the rows as an unscaled payload, and
+    decode them back to BF16 on the receiver. The packed row travels as a BF16 view because the
+    forward dispatch only copies bytes. Returns BF16 recv tokens, so the expert path and the
+    dispatch backward are unchanged; the backward is a straight-through BF16 gradient."""
+    tokens_2d = tokens.reshape(-1, tokens.shape[-1])
+    hidden = tokens_2d.shape[-1]
+    packed = _nvfp4_pack_tokens(tokens_2d, pow2_scale=_NVFP4_DIRECT_RECEIVE).view(torch.bfloat16)
+    packed_cols = packed.shape[-1]
+    handle_mem = buffer.handle_mem
+    tokens_per_expert = buffer.tokens_per_expert
+    total_recv_tokens = buffer.total_recv_tokens
+    eager = buffer.eager
+    if eager:
+        if recv_tokens is not None or recv_topk_weights is not None:
+            raise ValueError("eager mode cannot use caller-supplied recv buffers")
+        recv_packed, recv_topk_weights = tex.ep_prepare_and_dispatch(
+            handle_mem,
+            topk_idx,
+            packed,
+            topk_weights,
+            tokens_per_expert,
+            total_recv_tokens,
+            buffer.top_k,
+            buffer.alignment,
+        )
+        recv_out = _nvfp4_unpack_tokens(recv_packed.view(torch.uint8), hidden)
+        fused = False
+    else:
+        device = tokens_2d.device
+        num_recv_tokens = buffer.recv_capacity_per_rank
+        recv_packed = _alloc_io(
+            (num_recv_tokens, packed_cols), torch.bfloat16, device, buffer.zero_copy
+        )
+        if recv_topk_weights is None:
+            recv_topk_weights = _alloc_io(
+                (num_recv_tokens,), torch.float32, device, buffer.zero_copy
+            )
+        torch.ops.transformer_engine_ep.prepare_and_dispatch(
+            handle_mem,
+            topk_idx,
+            packed,
+            topk_weights,
+            tokens_per_expert,
+            total_recv_tokens,
+            buffer.top_k,
+            buffer.alignment,
+            recv_packed,
+            recv_topk_weights,
+            None,
+            None,
+        )
+        fused = (
+            (_NVFP4_FUSED_RECEIVE or _NVFP4_DIRECT_RECEIVE)
+            and recv_tokens is None
+            and _nvfp4_compute_active()
+        )
+        _log_nvfp4_receive_path_once(fused)
+        if fused and _NVFP4_DIRECT_RECEIVE:
+            recv_out = _nvfp4_direct_receive(
+                recv_packed.view(torch.uint8), hidden, tokens_per_expert, tokens.dtype
+            )
+        elif fused:
+            recv_out = _nvfp4_fused_receive(
+                recv_packed.view(torch.uint8), hidden, tokens_per_expert, tokens.dtype
+            )
+        else:
+            if recv_tokens is None:
+                recv_tokens = torch.empty(
+                    num_recv_tokens, hidden, dtype=torch.bfloat16, device=device
+                )
+            recv_out = _nvfp4_unpack_tokens(
+                recv_packed.view(torch.uint8), hidden, counts=tokens_per_expert, out=recv_tokens
+            )
+    state = _DispatchState(
+        handle_mem=handle_mem,
+        tokens_shape=tokens.shape,
+        topk_weights_shape=topk_weights.shape,
+        tokens_T_flat=tokens_2d.shape[0],
+        topk_T_flat=topk_weights.numel() // topk_weights.shape[-1],
+        top_k=topk_weights.shape[-1],
+        hidden_dim=hidden,
+        eager=eager,
+        # A fused-receive GroupedTensor is returned like the MXFP8 one (not detached).
+        is_scaled=not eager and fused,
+    )
+    return recv_out, recv_topk_weights, state
 
 
 def _ep_dispatch_bwd(
@@ -843,6 +1674,9 @@ class _CombineState:
     device: torch.device
     eager: bool
     zero_copy: bool
+    # NVFP4 combine backward returns FC2's grad_output as a direct-receive GroupedTensor. Decided
+    # in the forward, where the NVFP4 autocast state is visible.
+    nvfp4_direct: bool = False
 
 
 def _ep_combine_fwd(
@@ -874,6 +1708,12 @@ def _ep_combine_fwd(
         device=device,
         eager=eager,
         zero_copy=buffer.zero_copy,
+        nvfp4_direct=(
+            _NVFP4_DIRECT_CBWD
+            and not eager
+            and _is_nvfp4_recipe(bwd_quant_recipe)
+            and _nvfp4_compute_active()
+        ),
     )
     return result, state
 
@@ -887,7 +1727,9 @@ def _ep_combine_bwd(state: "_CombineState", g_result: torch.Tensor):
         g_result = g_result.contiguous()
     handle_mem = state.handle_mem
 
-    if state.bwd_quant_recipe is None:
+    if _is_nvfp4_recipe(state.bwd_quant_recipe):
+        grad_expert_out = _ep_combine_bwd_nvfp4(state, g_result)
+    elif state.bwd_quant_recipe is None:
         grad_expert_out = state.grad_out
         if grad_expert_out is None:
             grad_expert_out = _alloc_io(
@@ -932,6 +1774,49 @@ def _ep_combine_bwd(state: "_CombineState", g_result: torch.Tensor):
             ge_data, ge_scale_inv, state.token_counts, mx._fp8_dtype, state.expert_out_dtype
         )
     return grad_expert_out
+
+
+def _ep_combine_bwd_nvfp4(state: "_CombineState", g_result: torch.Tensor) -> torch.Tensor:
+    """NVFP4 combine backward: pack the result-grad rows to NVFP4 with stochastic rounding, scatter
+    the packed rows as an unscaled payload (the combine backward only copies bytes), and decode
+    them to BF16 in the expert_out grad. Decoding into ``state.grad_out`` when the caller supplies
+    it, bounded by the device-side per-expert counts so CUDA graph replays see the live count."""
+    recv_rows, hidden = state.expert_out_shape[0], state.expert_out_shape[-1]
+    if state.nvfp4_direct:
+        packed = _nvfp4_pack_tokens_cuda(g_result.reshape(-1, hidden), stochastic=True)
+        ge_packed = _alloc_io(
+            (recv_rows, packed.shape[-1] // 2), torch.bfloat16, state.device, state.zero_copy
+        )
+        torch.ops.transformer_engine_ep.combine_bwd(
+            state.handle_mem, packed.view(torch.bfloat16), ge_packed
+        )
+        _log_nvfp4_cbwd_path_once()
+        return _nvfp4_direct_receive(
+            ge_packed.view(torch.uint8),
+            hidden,
+            state.token_counts,
+            state.expert_out_dtype,
+            stochastic=True,
+        )
+    packed = _nvfp4_pack_tokens(g_result.reshape(-1, hidden), stochastic=True).view(torch.bfloat16)
+    ge_packed = _alloc_io(
+        (recv_rows, packed.shape[-1]), torch.bfloat16, state.device, state.zero_copy
+    )
+    if state.eager:
+        tex.ep_combine_bwd(state.handle_mem, packed, ge_packed, None, None)
+    else:
+        torch.ops.transformer_engine_ep.combine_bwd(state.handle_mem, packed, ge_packed)
+    grad_expert_out = state.grad_out
+    if grad_expert_out is None:
+        grad_expert_out = torch.empty(
+            state.expert_out_shape, dtype=state.expert_out_dtype, device=state.device
+        )
+    return _nvfp4_unpack_tokens(
+        ge_packed.view(torch.uint8),
+        hidden,
+        counts=None if state.eager else state.token_counts,
+        out=grad_expert_out.view(-1, hidden),
+    ).view(state.expert_out_shape)
 
 
 class _EpCombine(torch.autograd.Function):
@@ -1172,9 +2057,11 @@ def ep_dispatch(
     if buffer.dispatch_fwd_quant_recipe is not None:
         from ..common.recipe import MXFP8BlockScaling
 
-        if not isinstance(buffer.dispatch_fwd_quant_recipe, MXFP8BlockScaling):
+        if not isinstance(
+            buffer.dispatch_fwd_quant_recipe, MXFP8BlockScaling
+        ) and not _is_nvfp4_recipe(buffer.dispatch_fwd_quant_recipe):
             raise NotImplementedError(
-                "EP block-scaled dispatch supports MXFP8BlockScaling only; got "
+                "EP block-scaled dispatch supports MXFP8BlockScaling and NVFP4BlockScaling only; got "
                 f"{type(buffer.dispatch_fwd_quant_recipe).__name__}."
             )
 
@@ -1219,14 +2106,17 @@ def ep_combine(
     if num_local_tokens is None:
         num_local_tokens = buffer.max_tokens_per_rank
     # When combine_bwd_quant_recipe is set the combine backward sends the result-grad over the
-    # wire as MXFP8 and returns the expert_out grad as a GroupedTensor.
+    # wire quantized: MXFP8 returns the expert_out grad as a GroupedTensor, NVFP4 packs the rows
+    # with stochastic rounding and decodes them back to a BF16 expert_out grad.
     bwd_quant_recipe = None
     if buffer.combine_bwd_quant_recipe is not None:
         from ..common.recipe import MXFP8BlockScaling
 
-        if not isinstance(buffer.combine_bwd_quant_recipe, MXFP8BlockScaling):
+        if not isinstance(
+            buffer.combine_bwd_quant_recipe, MXFP8BlockScaling
+        ) and not _is_nvfp4_recipe(buffer.combine_bwd_quant_recipe):
             raise NotImplementedError(
-                "EP combine backward supports MXFP8BlockScaling only; got "
+                "EP combine backward supports MXFP8BlockScaling and NVFP4BlockScaling only; got "
                 f"{type(buffer.combine_bwd_quant_recipe).__name__}."
             )
         bwd_quant_recipe = buffer.combine_bwd_quant_recipe

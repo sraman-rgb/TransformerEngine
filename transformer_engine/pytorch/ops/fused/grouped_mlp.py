@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 import functools
 import inspect
+import logging
 import os
 from importlib.metadata import PackageNotFoundError, version as get_pkg_version
 from typing import Any, Literal, Optional
@@ -381,6 +382,91 @@ def _group_quantize_with_amax_for_grouped_mlp(
     )
 
 
+_FC1DY_AMAX_FROM_DGLU = os.getenv("MLPERF_FC1DY_AMAX_FROM_DGLU", "0") == "1"
+# Bound on the post-RHT amax relative to the input amax: the 16-point RHT is normalized by
+# 1/4, so |y| <= sum(|x|) / 4 <= 4 * max(|x|).
+_FC1DY_POST_RHT_AMAX_BOUND = float(os.getenv("MLPERF_FC1DY_POST_RHT_AMAX_BOUND", "4.0"))
+
+
+if _FC1DY_AMAX_FROM_DGLU:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _fc1_dy_amax_kernel(dglu_amax_ptr, row_ptr, col_ptr, n, col_factor, BLOCK: tl.constexpr):
+        idx = tl.arange(0, BLOCK)
+        mask = idx < n
+        a0 = tl.load(dglu_amax_ptr + 2 * idx, mask=mask, other=0.0)
+        a1 = tl.load(dglu_amax_ptr + 2 * idx + 1, mask=mask, other=0.0)
+        amax = tl.maximum(tl.maximum(a0, a1), 0.0)
+        # Round to the BF16 output's amax (rounding to nearest is monotone).
+        amax = amax.to(tl.bfloat16).to(tl.float32)
+        tl.store(row_ptr + idx, amax, mask=mask)
+        tl.store(col_ptr + idx, amax * col_factor, mask=mask)
+
+
+def _fc1_dy_amax_from_dglu(
+    dglu_amax: torch.Tensor, num_groups: int, with_rht: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert rowwise and columnwise amax of the dGLU output from its epilogue amax.
+
+    ``dglu_amax`` is (num_groups, 2, 1): one amax per GLU half, -inf for experts with no
+    tokens. The epilogue reduces the FP32 values before they are rounded to the BF16 output,
+    so the result is rounded to BF16 to equal the output's amax exactly.
+    """
+    row_amax = torch.empty(num_groups, dtype=torch.float32, device=dglu_amax.device)
+    col_amax = torch.empty_like(row_amax)
+    _fc1_dy_amax_kernel[(1,)](
+        dglu_amax,
+        row_amax,
+        col_amax,
+        num_groups,
+        _FC1DY_POST_RHT_AMAX_BOUND if with_rht else 1.0,
+        BLOCK=max(16, triton.next_power_of_2(num_groups)),
+    )
+    return row_amax, col_amax
+
+
+_FC1DY_AMAX_CHECK = os.getenv("MLPERF_FC1DY_AMAX_CHECK", "0") == "1"
+_fc1_dy_amax_check_count = 0
+
+
+def _check_fc1_dy_amax(dy, quantizer, num_groups, split_sizes, tensor_offsets, row_amax, col_amax):
+    """Debug only: compare the dGLU-derived amaxes against TE's own grouped amax pass."""
+    global _fc1_dy_amax_check_count  # pylint: disable=global-statement
+    if _fc1_dy_amax_check_count >= 8:
+        return
+    _fc1_dy_amax_check_count += 1
+    ref = tex.group_quantize(dy, quantizer, num_groups, split_sizes, tensor_offsets=tensor_offsets)
+    ref_row = ref.amax.view(-1).float()
+    ref_col = ref.columnwise_amax.view(-1).float()
+    sizes = split_sizes.tolist()
+    starts = [0]
+    for s in sizes[:-1]:
+        starts.append(starts[-1] + s)
+    true_row = torch.stack(
+        [
+            dy[st : st + n].abs().amax().float() if n > 0 else dy.new_zeros((), dtype=torch.float32)
+            for st, n in zip(starts, sizes)
+        ]
+    )
+    live = torch.tensor([n > 0 for n in sizes], device=dy.device)
+    rel = lambda a, b: ((a - b).abs() / b.clamp_min(1e-30))[live].max().item() if live.any() else 0.0
+    ratio = (ref_col / ref_row.clamp_min(1e-30))[live]
+    logging.getLogger(__name__).warning(
+        "FC1 dy amax check %d: dglu-vs-true row rel %.3e, dglu-vs-TE row rel %.3e, "
+        "TE post-RHT/row amax ratio min %.3f mean %.3f max %.3f, bound/TE col min %.3f max %.3f",
+        _fc1_dy_amax_check_count,
+        rel(row_amax.float(), true_row),
+        rel(row_amax.float(), ref_row),
+        ratio.min().item() if ratio.numel() else 0.0,
+        ratio.mean().item() if ratio.numel() else 0.0,
+        ratio.max().item() if ratio.numel() else 0.0,
+        (col_amax.float() / ref_col.clamp_min(1e-30))[live].min().item() if live.any() else 0.0,
+        (col_amax.float() / ref_col.clamp_min(1e-30))[live].max().item() if live.any() else 0.0,
+    )
+
+
 def _nvfp4_amax(
     tensors: GroupedTensor | Iterable[NVFP4TensorStorage],
     *,
@@ -450,6 +536,131 @@ def _nvfp4_global_scale(
     # 6.0 is NVFP4_FP4_MAX
     denom = 6.0 * _nvfp4_scale_max(quantizer)
     return _nvfp4_amax(tensors, columnwise=columnwise).to(torch.float32) / denom
+
+
+_FUSED_NVFP4_ALPHA = os.getenv("NVTE_FUSED_NVFP4_ALPHA", "0") == "1"
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _nvfp4_alpha_kernel(
+        a_ptr, b_ptr, out_a_ptr, out_b_ptr, n, a_bcast, b_bcast, denom_a, denom_b,
+        MODE: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """Per-group NVFP4 global scales and their product in one launch.
+
+        Matches the eager ops bit for bit: tensor / scalar is a multiply by the fp32
+        reciprocal on CUDA, followed by an IEEE multiply (and sqrt for MODE 1).
+        MODE 0: out_a = gs_a * gs_b. MODE 1: out_a = sqrt(gs_a * gs_b).
+        MODE 2: out_a = gs_a, out_b = gs_b.
+        """
+        idx = tl.arange(0, BLOCK)
+        mask = idx < n
+        a = tl.load(a_ptr + tl.where(a_bcast, 0, idx), mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + tl.where(b_bcast, 0, idx), mask=mask, other=0.0).to(tl.float32)
+        one = tl.full([BLOCK], 1.0, tl.float32)
+        inv_a = tl.math.div_rn(one, tl.full([BLOCK], denom_a, tl.float32))
+        inv_b = tl.math.div_rn(one, tl.full([BLOCK], denom_b, tl.float32))
+        ga = a * inv_a
+        gb = b * inv_b
+        if MODE == 2:
+            tl.store(out_a_ptr + idx, ga, mask=mask)
+            tl.store(out_b_ptr + idx, gb, mask=mask)
+        else:
+            prod = ga * gb
+            if MODE == 1:
+                prod = tl.math.sqrt_rn(prod)
+            tl.store(out_a_ptr + idx, prod, mask=mask)
+
+    @triton.jit
+    def _round_bf16_f32_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+        """y = float32(bfloat16(x)) (round to nearest even), one pass."""
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        tl.store(y_ptr + offs, x.to(tl.bfloat16).to(tl.float32), mask=mask)
+
+    _HAVE_TRITON = True
+except ImportError:  # pragma: no cover
+    _HAVE_TRITON = False
+
+# overlay_casts (MLPERF_CASTS_DPROB=1): the scale (router prob) gradient leaves the fused grouped MLP as
+# float32(bfloat16(dprob)) in one kernel when the scales input is fp32 (NCCL-EP dispatched probs). Before, the
+# backward cast dprob to bf16 and autograd cast it back to the fp32 input dtype (two kernels, same values).
+_CASTS_DPROB = os.getenv("MLPERF_CASTS_DPROB", "0") == "1"
+
+
+def _round_bf16_f32(x: torch.Tensor) -> torch.Tensor:
+    """float32(bfloat16(x)) for a contiguous fp32 tensor, in one kernel."""
+    x = x.contiguous()
+    y = torch.empty_like(x)
+    n = x.numel()
+    if n:
+        block = 1024
+        _round_bf16_f32_kernel[((n + block - 1) // block,)](x, y, n, BLOCK=block)
+    return y
+
+
+def _nvfp4_alpha_fused(tensors_a, quantizer_a, columnwise_a, tensors_b, quantizer_b, columnwise_b,
+                       *, num_groups, device, mode):
+    """Fused ``_nvfp4_global_scale`` pair; returns None if the fused path does not apply."""
+    if not (_FUSED_NVFP4_ALPHA and _HAVE_TRITON):
+        return None
+    if getattr(quantizer_a, "disable_second_level_scale", False) or getattr(
+        quantizer_b, "disable_second_level_scale", False
+    ):
+        return None
+    amax_a = _nvfp4_amax(tensors_a, columnwise=columnwise_a)
+    amax_b = _nvfp4_amax(tensors_b, columnwise=columnwise_b)
+    if amax_a.dtype != torch.float32 or amax_b.dtype != torch.float32:
+        return None
+    na, nb = amax_a.numel(), amax_b.numel()
+    n = max(na, nb)
+    if (na not in (1, n)) or (nb not in (1, n)) or n > 4096:
+        return None
+    block = max(16, triton.next_power_of_2(n))
+    out_a = torch.empty(n, dtype=torch.float32, device=amax_a.device)
+    out_b = torch.empty(n, dtype=torch.float32, device=amax_a.device) if mode == 2 else out_a
+    _nvfp4_alpha_kernel[(1,)](
+        amax_a, amax_b, out_a, out_b, n, na == 1 and n > 1, nb == 1 and n > 1,
+        6.0 * _nvfp4_scale_max(quantizer_a), 6.0 * _nvfp4_scale_max(quantizer_b),
+        MODE=mode, BLOCK=block,
+    )
+    if mode == 2:
+        return out_a, out_b
+    return out_a
+
+
+_DISCRETE_WEIGHT_SWIZZLE_CACHE_ON = os.getenv("NVTE_NVFP4_WEIGHT_SWIZZLE_CACHE", "0") == "1"
+_DISCRETE_WEIGHT_SWIZZLE_CACHE: dict = {}
+
+
+def _swizzle_pack_discrete(datas, scales, fmt, device):
+    """``swizzle_scales_and_pack_ptrs_for_discrete_weights`` cached until the weights change.
+
+    Expert weights only change at a parameter all-gather, so the swizzled scales and the
+    packed pointer arrays are reused by every microbatch of a step. When captured in a CUDA
+    graph, the first use in the step (re)computes into the cached buffers on every replay.
+    """
+    fn = tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights
+    if not _DISCRETE_WEIGHT_SWIZZLE_CACHE_ON:
+        return fn(datas, scales, fmt, device)
+    from ...tensor.utils import param_gather_generation
+
+    gen = param_gather_generation()
+    key = (
+        fmt,
+        tuple(t.data_ptr() for t in datas),
+        tuple(t.data_ptr() for t in scales),
+    )
+    hit = _DISCRETE_WEIGHT_SWIZZLE_CACHE.get(key)
+    if hit is not None and hit[0] == gen:
+        return hit[1]
+    result = fn(datas, scales, fmt, device)
+    _DISCRETE_WEIGHT_SWIZZLE_CACHE[key] = (gen, result)
+    return result
 
 
 def _single_quantized_tensor_from_grouped(
@@ -776,20 +987,28 @@ def _cudnn_compute_wgrad(
                 device=device,
             )
         else:
-            common_wgrad_kwargs["global_scale_a"] = _nvfp4_global_scale(
-                grouped_dy,
-                dy_quantizer,
-                columnwise=True,
-                num_groups=num_groups,
-                device=device,
+            fused_scales = _nvfp4_alpha_fused(
+                grouped_dy, dy_quantizer, True, grouped_x, x_quantizer, True,
+                num_groups=num_groups, device=device, mode=2,
             )
-            common_wgrad_kwargs["global_scale_b"] = _nvfp4_global_scale(
-                grouped_x,
-                x_quantizer,
-                columnwise=True,
-                num_groups=num_groups,
-                device=device,
-            )
+            if fused_scales is not None:
+                common_wgrad_kwargs["global_scale_a"] = fused_scales[0]
+                common_wgrad_kwargs["global_scale_b"] = fused_scales[1]
+            else:
+                common_wgrad_kwargs["global_scale_a"] = _nvfp4_global_scale(
+                    grouped_dy,
+                    dy_quantizer,
+                    columnwise=True,
+                    num_groups=num_groups,
+                    device=device,
+                )
+                common_wgrad_kwargs["global_scale_b"] = _nvfp4_global_scale(
+                    grouped_x,
+                    x_quantizer,
+                    columnwise=True,
+                    num_groups=num_groups,
+                    device=device,
+                )
         common_wgrad_kwargs["input_order"] = "tensor_ragged"
         wgrad_sf_dtype_override = _nvfp4_sf_dtype_override(dy_quantizer)
         if wgrad_sf_dtype_override is not None:
@@ -1617,22 +1836,28 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             # cuDNN receives NVFP4 block-scaled inputs without TE's per-group
             # global scale factors, so alpha supplies the product of the two
             # operand global scales.
-            fc1_alpha_tensor = (
-                _nvfp4_global_scale(
-                    grouped_fc1_x,
-                    fc1_input_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-                * _nvfp4_global_scale(
-                    grouped_fc1_weight,
-                    fc1_weight_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-            ).to(torch.float32)
+            fc1_alpha_tensor = _nvfp4_alpha_fused(
+                grouped_fc1_x, fc1_input_quantizer, False,
+                grouped_fc1_weight, fc1_weight_quantizer, False,
+                num_groups=num_groups, device=device, mode=0,
+            )
+            if fc1_alpha_tensor is None:
+                fc1_alpha_tensor = (
+                    _nvfp4_global_scale(
+                        grouped_fc1_x,
+                        fc1_input_quantizer,
+                        columnwise=False,
+                        num_groups=num_groups,
+                        device=device,
+                    )
+                    * _nvfp4_global_scale(
+                        grouped_fc1_weight,
+                        fc1_weight_quantizer,
+                        columnwise=False,
+                        num_groups=num_groups,
+                        device=device,
+                    )
+                ).to(torch.float32)
         else:
             fc1_alpha_tensor = alpha_tensor
 
@@ -1806,7 +2031,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             else:
                 # Discrete-weight kernel: per-expert data/scale pointers
                 fc1_b_ptrs, fc1_sfb_ptrs, _fc1_sfb_buffer = (
-                    tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                    _swizzle_pack_discrete(
                         [w._rowwise_data for w in grouped_fc1_weight],
                         [w._rowwise_scale_inv for w in grouped_fc1_weight],
                         "nvfp4" if use_nvfp4 else "mxfp8_rowwise",
@@ -1980,22 +2205,28 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 sf_swizzled=grouped_fc2_x._with_gemm_swizzled_scales,
             )
 
-            fc2_fwd_alpha_tensor = (
-                _nvfp4_global_scale(
-                    grouped_fc2_x,
-                    fc2_input_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-                * _nvfp4_global_scale(
-                    grouped_fc2_weight,
-                    fc2_weight_quantizer,
-                    columnwise=False,
-                    num_groups=num_groups,
-                    device=device,
-                )
-            ).to(torch.float32)
+            fc2_fwd_alpha_tensor = _nvfp4_alpha_fused(
+                grouped_fc2_x, fc2_input_quantizer, False,
+                grouped_fc2_weight, fc2_weight_quantizer, False,
+                num_groups=num_groups, device=device, mode=0,
+            )
+            if fc2_fwd_alpha_tensor is None:
+                fc2_fwd_alpha_tensor = (
+                    _nvfp4_global_scale(
+                        grouped_fc2_x,
+                        fc2_input_quantizer,
+                        columnwise=False,
+                        num_groups=num_groups,
+                        device=device,
+                    )
+                    * _nvfp4_global_scale(
+                        grouped_fc2_weight,
+                        fc2_weight_quantizer,
+                        columnwise=False,
+                        num_groups=num_groups,
+                        device=device,
+                    )
+                ).to(torch.float32)
 
             fc2_scales_tensor = (
                 fc2_scales.detach().to(dtype=torch.float32).reshape(-1, 1, 1)
@@ -2039,7 +2270,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 fc2_quant_kwargs["sfb_tensor"] = fc2_w_scales
             else:
                 fc2_b_ptrs, fc2_sfb_ptrs, _fc2_sfb_buffer = (
-                    tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                    _swizzle_pack_discrete(
                         [w._rowwise_data for w in grouped_fc2_weight],
                         [w._rowwise_scale_inv for w in grouped_fc2_weight],
                         "nvfp4",
@@ -2136,7 +2367,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     fc2_quant_kwargs["sfb_tensor"] = fc2_w_scales
                 else:
                     fc2_b_ptrs, fc2_sfb_ptrs, _fc2_sfb_buffer = (
-                        tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                        _swizzle_pack_discrete(
                             [w._rowwise_data for w in grouped_fc2_weight],
                             [w._rowwise_scale_inv for w in grouped_fc2_weight],
                             "mxfp8_rowwise",
@@ -2483,21 +2714,33 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
 
         fc2_d_dtype = torch.bfloat16 if use_nvfp4 else torch.float8_e4m3fn
         if use_nvfp4:
-            fc2_dy_global_scale = _nvfp4_global_scale(
-                grouped_fc2_dy,
-                fc2_grad_output_quantizer,
-                columnwise=False,
-                num_groups=num_groups,
-                device=device,
+            fc2_alpha_fused = (
+                None
+                if activation_is_srelu
+                else _nvfp4_alpha_fused(
+                    grouped_fc2_dy, fc2_grad_output_quantizer, False,
+                    grouped_fc2_weight, fc2_weight_quantizer, True,
+                    num_groups=num_groups, device=device, mode=1,
+                )
             )
-            fc2_weight_col_global_scale = _nvfp4_global_scale(
-                grouped_fc2_weight,
-                fc2_weight_quantizer,
-                columnwise=True,
-                num_groups=num_groups,
-                device=device,
-            )
-            if activation_is_srelu:
+            if fc2_alpha_fused is None:
+                fc2_dy_global_scale = _nvfp4_global_scale(
+                    grouped_fc2_dy,
+                    fc2_grad_output_quantizer,
+                    columnwise=False,
+                    num_groups=num_groups,
+                    device=device,
+                )
+                fc2_weight_col_global_scale = _nvfp4_global_scale(
+                    grouped_fc2_weight,
+                    fc2_weight_quantizer,
+                    columnwise=True,
+                    num_groups=num_groups,
+                    device=device,
+                )
+            if fc2_alpha_fused is not None:
+                fc2_alpha_tensor = fc2_alpha_fused.expand(num_groups)
+            elif activation_is_srelu:
                 # DSReLU applies alpha once, so pass the full product of the
                 # two operand global scales.
                 fc2_alpha_tensor = (
@@ -2647,7 +2890,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 fc2_dactivation_kwargs["sfb_tensor"] = fc2_w_scales
             else:
                 fc2_b_ptrs, fc2_sfb_ptrs, _fc2_sfb_buffer = (
-                    tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                    _swizzle_pack_discrete(
                         [w._columnwise_data for w in grouped_fc2_weight],
                         [w._columnwise_scale_inv for w in grouped_fc2_weight],
                         "nvfp4" if use_nvfp4 else "mxfp8_columnwise",
@@ -2759,7 +3002,18 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 fc2_bias_grads = [fc2_dbias_packed[idx] for idx in range(num_groups)]
 
         if grad_scales is not None:
-            grad_scales = grad_scales.to(dtype=dtype)
+            if (
+                _CASTS_DPROB
+                and _HAVE_TRITON
+                and scales is not None
+                and scales.dtype == torch.float32
+                and grad_scales.dtype == torch.float32
+                and dtype == torch.bfloat16
+            ):
+                # == grad_scales.to(bf16) followed by autograd's cast back to the fp32 scales dtype
+                grad_scales = _round_bf16_f32(grad_scales)
+            else:
+                grad_scales = grad_scales.to(dtype=dtype)
 
         fc1_bias_grads: Optional[list[Optional[torch.Tensor]]] = None
         fc1_bias_grad_packed: Optional[torch.Tensor] = None
@@ -2782,14 +3036,49 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 columnwise=fc1_ctx.weight_requires_grad,
             )
             fc1_grad_output_quantizer.optimize_for_gemm = True
-            grouped_fc1_dy = _group_quantize_for_grouped_mlp(
-                fc1_dy_bf16,
-                fc1_grad_output_quantizer,
-                num_groups,
-                split_sizes,
-                tensor_offsets=fc1_dy_tensor_offsets,
-                use_dense_single_group=use_dense_single_group,
-            )
+            dglu_amax = fc2_dgrad_kernel_out.get("amax_tensor")
+            if (
+                _FC1DY_AMAX_FROM_DGLU
+                and dglu_amax is not None
+                and isinstance(fc1_grad_output_quantizer, NVFP4Quantizer)
+                and not getattr(fc1_grad_output_quantizer, "row_scaled_nvfp4", False)
+                and dglu_amax.numel() == 2 * num_groups
+            ):
+                # The dGLU epilogue already reduced |dy| per expert. Reuse it as the exact
+                # rowwise amax and bound the post-RHT columnwise amax by it, skipping the
+                # separate grouped Hadamard-amax pass over dy.
+                fc1_dy_row_amax, fc1_dy_col_amax = _fc1_dy_amax_from_dglu(
+                    dglu_amax, num_groups, fc1_grad_output_quantizer.with_rht
+                )
+                if _FC1DY_AMAX_CHECK and not torch.cuda.is_current_stream_capturing():
+                    _check_fc1_dy_amax(
+                        fc1_dy_bf16,
+                        fc1_grad_output_quantizer,
+                        num_groups,
+                        split_sizes,
+                        fc1_dy_tensor_offsets,
+                        fc1_dy_row_amax,
+                        fc1_dy_col_amax,
+                    )
+                grouped_fc1_dy = _group_quantize_with_amax_for_grouped_mlp(
+                    fc1_dy_bf16,
+                    fc1_grad_output_quantizer,
+                    num_groups,
+                    split_sizes,
+                    fc1_dy_row_amax,
+                    fc1_dy_col_amax,
+                    tensor_offsets=fc1_dy_tensor_offsets,
+                    use_dense_single_group=use_dense_single_group,
+                )
+            else:
+                grouped_fc1_dy = _group_quantize_for_grouped_mlp(
+                    fc1_dy_bf16,
+                    fc1_grad_output_quantizer,
+                    num_groups,
+                    split_sizes,
+                    tensor_offsets=fc1_dy_tensor_offsets,
+                    use_dense_single_group=use_dense_single_group,
+                )
         else:
             grouped_fc1_dy = GroupedTensor(
                 shape=(out_shape[0], fc1_weight_shape[0]),
@@ -2907,22 +3196,28 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     sf_swizzled=grouped_fc1_dy._with_gemm_swizzled_scales,
                 )
 
-                fc1_dgrad_alpha = (
-                    _nvfp4_global_scale(
-                        grouped_fc1_dy,
-                        fc1_grad_output_quantizer,
-                        columnwise=False,
-                        num_groups=num_groups,
-                        device=device,
-                    )
-                    * _nvfp4_global_scale(
-                        grouped_fc1_weight,
-                        fc1_weight_quantizer,
-                        columnwise=True,
-                        num_groups=num_groups,
-                        device=device,
-                    )
-                ).to(torch.float32)
+                fc1_dgrad_alpha = _nvfp4_alpha_fused(
+                    grouped_fc1_dy, fc1_grad_output_quantizer, False,
+                    grouped_fc1_weight, fc1_weight_quantizer, True,
+                    num_groups=num_groups, device=device, mode=0,
+                )
+                if fc1_dgrad_alpha is None:
+                    fc1_dgrad_alpha = (
+                        _nvfp4_global_scale(
+                            grouped_fc1_dy,
+                            fc1_grad_output_quantizer,
+                            columnwise=False,
+                            num_groups=num_groups,
+                            device=device,
+                        )
+                        * _nvfp4_global_scale(
+                            grouped_fc1_weight,
+                            fc1_weight_quantizer,
+                            columnwise=True,
+                            num_groups=num_groups,
+                            device=device,
+                        )
+                    ).to(torch.float32)
 
                 fc1_dgrad_kwargs = {
                     "a_tensor": fc1_dgrad_a_data,
@@ -2964,7 +3259,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     fc1_dgrad_kwargs["sfb_tensor"] = fc1_w_scales
                 else:
                     fc1_b_ptrs, fc1_sfb_ptrs, _fc1_sfb_buffer = (
-                        tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                        _swizzle_pack_discrete(
                             [w._columnwise_data for w in grouped_fc1_weight],
                             [w._columnwise_scale_inv for w in grouped_fc1_weight],
                             "nvfp4",
@@ -3044,7 +3339,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     fc1_dgrad_kwargs["sfb_tensor"] = fc1_w_scales
                 else:
                     fc1_b_ptrs, fc1_sfb_ptrs, _fc1_sfb_buffer = (
-                        tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                        _swizzle_pack_discrete(
                             [w._columnwise_data for w in grouped_fc1_weight],
                             [w._columnwise_scale_inv for w in grouped_fc1_weight],
                             "nvfp4" if use_nvfp4 else "mxfp8_columnwise",

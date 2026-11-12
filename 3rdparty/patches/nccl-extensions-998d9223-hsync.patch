@@ -1,0 +1,446 @@
+diff --git a/nccl_ep/device/ht_ep.cuh b/nccl_ep/device/ht_ep.cuh
+index 9213476..0b6cac3 100644
+--- a/nccl_ep/device/ht_ep.cuh
++++ b/nccl_ep/device/ht_ep.cuh
+@@ -7885,8 +7885,59 @@ struct combine_push_param_t {
+     int lsa_team_size;                // decode dst_rank; staging row = t*team_size + R
+     // When set, head/tail sync runs as separate kernels; this kernel skips the inline sync.
+     bool unfused_sync;
++    // Peer staging gate (NCCL_EP_HT_COMBINE_PEER_GATE; null = off, the head barrier runs instead).
++    // inbox[p] = number of combine reduces peer p has finished (p's staging is free once it is
++    // >= *count, this rank's own finished-reduce count). See comb_peer_gate_wait.
++    const uint32_t* peer_gate_inbox;
++    const uint32_t* peer_gate_count;
+ };
+ 
++// ---- Peer staging gate (replaces the push-combine head barrier when enabled) ----
++// The push-combine head barrier only protects each destination's staging: rank r may push its
++// k-th combine into peer p's staging once p has finished reading it in its (k-1)-th combine
++// reduce. Every rank runs comb_peer_signal right after each combine reduce: it bumps a local
++// count and publishes it (st.release.sys) into slot [my_rank] of every peer's inbox. A push to
++// p then needs inbox[p] >= this rank's own count (= k-1), with wrap-safe compare. In steady state
++// the flag is long set, so no rank waits for slower peers to *arrive* at the combine, and the
++// head-sync kernel launch disappears. Counters live on the device, so CUDA-graph replay is safe.
++constexpr long long kCombPeerGateTimeoutCycles = 200000000000ll;  // ~80 s at 2.4 GHz, then trap
++__device__ __forceinline__ bool comb_peer_gate_ready(uint32_t v, uint32_t need) {
++    return static_cast<int32_t>(v - need) >= 0;
++}
++__device__ __forceinline__ void comb_peer_gate_wait(
++    const uint32_t* inbox, uint32_t* s_ready, int peer, uint32_t need) {
++    const uint32_t bit = 1u << (peer & 31);
++    if (*reinterpret_cast<volatile uint32_t*>(&s_ready[peer >> 5]) & bit) return;
++    const long long t0 = clock64();
++    while (!comb_peer_gate_ready(
++        static_cast<uint32_t>(nccl_ep::ld_acquire_sys_global(reinterpret_cast<const int*>(inbox + peer))), need)) {
++        if (clock64() - t0 > kCombPeerGateTimeoutCycles) {
++            printf("[nccl_ep] combine peer gate timeout: peer %d inbox %u need %u\n", peer,
++                   *reinterpret_cast<const volatile uint32_t*>(inbox + peer), need);
++            __trap();
++        }
++    }
++    atomicOr(&s_ready[peer >> 5], bit);
++}
++struct comb_peer_signal_param_t {
++    uint32_t* peer_slots[kPullMaxLsaRanks];  // &inbox_p[my_rank] for every team rank p (self included)
++    uint32_t* count;                         // local finished-reduce count
++    int lsa_team_size;
++};
++// One warp, launched after each push-combine reduce (stream order: the reduce has finished
++// reading staging).
++__device__ __forceinline__ void comb_peer_signal(const comb_peer_signal_param_t& p) {
++    uint32_t c = 0;
++    if (threadIdx.x == 0) {
++        c = *p.count + 1u;
++        *p.count = c;
++    }
++    c = __shfl_sync(0xFFFFFFFFu, c, 0);
++    for (int i = static_cast<int>(threadIdx.x); i < p.lsa_team_size; i += 32) {
++        nccl_ep::st_release_sys_global(reinterpret_cast<const int*>(p.peer_slots[i]), static_cast<int>(c));
++    }
++}
++
+ // One recv slot per warp (kSlotsPerBlock in parallel), identical
+ // gather-reduce to local_permute_reduce; the reduced row is assembled in a per-warp smem buffer
+ // and pushed to the remote destination staging slot [t*team_size + R], one TMA store per row
+@@ -7916,7 +7967,9 @@ __device__ __forceinline__ void combine_push(
+     const float* __restrict__ topk_weights_em = nullptr,
+     const int32_t* __restrict__ srcpos_map = nullptr,
+     bool unfused_sync = false,
+-    uint8_t* __restrict__ smem_bytes = nullptr) {
++    uint8_t* __restrict__ smem_bytes = nullptr,
++    const uint32_t* __restrict__ peer_gate_inbox = nullptr,
++    const uint32_t* __restrict__ peer_gate_count = nullptr) {
+     constexpr int kRowBytes = HiddenInt4 * 16;
+     // One warp per recv slot: narrow reduction granularity keeps many rows in flight per
+     // block, saturating the NVLink write path. Each token is reduced into a per-warp smem row,
+@@ -7929,7 +7982,8 @@ __device__ __forceinline__ void combine_push(
+     // ---- HEAD SYNC: gates peer pushes until all ranks reach combine, so a push can't
+     // land while the previous iteration's combine_reduce is still reading staging. ----
+     // Skipped when a separate head-sync kernel runs it.
+-    if (!unfused_sync) lsa_grid_head_gate(dcomm, head_sync_flag);
++    // With the peer gate on, the per-destination staging-free check below replaces it.
++    if (!unfused_sync && peer_gate_inbox == nullptr) lsa_grid_head_gate(dcomm, head_sync_flag);
+ 
+     // Metadata smem is sized to the max block; only the first kSlotsPerBlock rows are used.
+     __shared__ int32_t smem_flat2em_slot_map[kCombinePushMaxSlots][MaxTopK];
+@@ -7938,6 +7992,19 @@ __device__ __forceinline__ void combine_push(
+     // Per-warp mbarrier for the single-chunk path's opt-in TMA-load source relay (n==1 fast path,
+     // see below). Unused (but still reserved, see combine_push_slots_per_block) when !kSingleChunk.
+     __shared__ uint64_t s_mbar[kCombinePushMaxSlots];
++    // Peer gate: bit p set once peer p's staging is known free for this combine.
++    __shared__ uint32_t s_peer_ready[kPullMaxLsaRanks / 32];
++    uint32_t gate_need = 0;
++    if (peer_gate_inbox != nullptr) {
++        gate_need = *reinterpret_cast<const volatile uint32_t*>(peer_gate_count);
++        if (threadIdx.x < kPullMaxLsaRanks / 32) s_peer_ready[threadIdx.x] = 0u;
++        __syncthreads();
++        for (int i = static_cast<int>(threadIdx.x); i < lsa_team_size; i += static_cast<int>(blockDim.x)) {
++            const uint32_t v = static_cast<uint32_t>(
++                nccl_ep::ld_acquire_sys_global(reinterpret_cast<const int*>(peer_gate_inbox + i)));
++            if (comb_peer_gate_ready(v, gate_need)) atomicOr(&s_peer_ready[i >> 5], 1u << (i & 31));
++        }
++    }
+     // Dynamic smem: one per-warp chunk buffer for the TMA push (kBufInt4 int4 each).
+     int4* const s_rows = reinterpret_cast<int4*>(smem_bytes);
+     // Backward co-locates the prob in the token staging row's trailing pad (offset kRowBytes),
+@@ -8012,6 +8079,7 @@ __device__ __forceinline__ void combine_push(
+                 const int dst_rank = dst_id.rank;
+                 const int t = dst_id.token;
+                 const int64_t dst_row = static_cast<int64_t>(t) * lsa_team_size + my_lsa_rank;
++                if (peer_gate_inbox != nullptr) comb_peer_gate_wait(peer_gate_inbox, s_peer_ready, dst_rank, gate_need);
+                 s_dst[slot_in_block] = reinterpret_cast<int4*>(
+                     static_cast<uint8_t*>(peer_staging_ptrs[dst_rank]) +
+                     static_cast<size_t>(dst_row) * comb_stage_stride_bytes(kRowBytes, BACKWARD_COMBINE));
+diff --git a/nccl_ep/device/ht_ep_adapter.cu b/nccl_ep/device/ht_ep_adapter.cu
+index c02d35a..698a054 100644
+--- a/nccl_ep/device/ht_ep_adapter.cu
++++ b/nccl_ep/device/ht_ep_adapter.cu
+@@ -2718,12 +2718,15 @@ ncclResult_t launch_combine_push(
+     const int32_t* srcpos_map,
+     bool backward,
+     bool unfused_sync,
+-    bool nucs) {
++    bool nucs,
++    const uint32_t* peer_gate_inbox,
++    const uint32_t* peer_gate_count) {
+     assert(row_bytes > 0 && (row_bytes % 16) == 0);
+     assert(top_k > 0);
+     assert(sm_count > 0);
+     assert(tokens_per_rank > 0 && lsa_team_size > 0);
+     assert(my_lsa_rank >= 0 && my_lsa_rank < lsa_team_size);
++    assert((peer_gate_inbox == nullptr) == (peer_gate_count == nullptr));
+     // A zero-recv rank (eager mode) pushes nothing but must still launch to
+     // participate in the head-gate and tail-barrier sync; its empty EM input
+     // weights are null, so only require topk_weights_em when it has recv tokens.
+@@ -2753,8 +2756,11 @@ ncclResult_t launch_combine_push(
+     p.topk_weights_em = topk_weights_em;
+     p.srcpos_map = srcpos_map;
+     p.unfused_sync = unfused_sync;
++    p.peer_gate_inbox = peer_gate_inbox;
++    p.peer_gate_count = peer_gate_count;
+ 
+-    if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
++    // The peer gate (checked per destination inside the push) replaces the head barrier.
++    if (unfused_sync && peer_gate_inbox == nullptr) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
+     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
+         top_k, row_bytes, static_cast<int>(grid), ep_size, p, stream, token_dtype, backward, nucs);
+     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
+@@ -2764,6 +2770,19 @@ ncclResult_t launch_combine_push(
+     return ncclSuccess;
+ }
+ 
++ncclResult_t launch_comb_peer_signal(
++    uint32_t* const* peer_slots,
++    uint32_t* count,
++    int lsa_team_size,
++    cudaStream_t stream) {
++    assert(lsa_team_size > 0 && lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
++    ::ht_ep::comb_peer_signal_param_t p{};
++    for (int i = 0; i < lsa_team_size; i++) p.peer_slots[i] = peer_slots[i];
++    p.count = count;
++    p.lsa_team_size = lsa_team_size;
++    return jit::launch_comb_peer_signal(p, stream);
++}
++
+ ncclResult_t launch_combine_reduce_stage(
+     void* attn_output,
+     const void* staging,
+diff --git a/nccl_ep/device/ht_ep_adapter.cuh b/nccl_ep/device/ht_ep_adapter.cuh
+index 61e3eb2..f252cdd 100644
+--- a/nccl_ep/device/ht_ep_adapter.cuh
++++ b/nccl_ep/device/ht_ep_adapter.cuh
+@@ -535,7 +535,17 @@ ncclResult_t launch_combine_push(
+     bool backward = false,
+     // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
+     bool unfused_sync = false,
+-    bool nucs = false);
++    bool nucs = false,
++    // Peer gate (NCCL_EP_HT_COMBINE_PEER_GATE): replaces the head barrier; null = off.
++    const uint32_t* peer_gate_inbox = nullptr,
++    const uint32_t* peer_gate_count = nullptr);
++
++// Publish this rank's finished push-combine reduce count to every team peer (peer gate).
++ncclResult_t launch_comb_peer_signal(
++    uint32_t* const* peer_slots,
++    uint32_t* count,
++    int lsa_team_size,
++    cudaStream_t stream);
+ 
+ ncclResult_t launch_combine_reduce_stage(
+     void* attn_output,
+diff --git a/nccl_ep/device/jit/ht_combine_jit.cuh b/nccl_ep/device/jit/ht_combine_jit.cuh
+index eab33d5..21aa42e 100644
+--- a/nccl_ep/device/jit/ht_combine_jit.cuh
++++ b/nccl_ep/device/jit/ht_combine_jit.cuh
+@@ -625,7 +625,9 @@ inline ncclResult_t launch_combine_push(
+             << "      p.topk_weights_em,\n"
+             << "      p.srcpos_map,\n"
+             << "      p.unfused_sync,\n"
+-            << "      smem_bytes);\n"
++            << "      smem_bytes,\n"
++            << "      p.peer_gate_inbox,\n"
++            << "      p.peer_gate_count);\n"
+             << "}\n";
+         return src.str();
+     }();
+diff --git a/nccl_ep/device/jit/ht_lsa_sync_jit.cuh b/nccl_ep/device/jit/ht_lsa_sync_jit.cuh
+index 72105d7..afdb7ad 100644
+--- a/nccl_ep/device/jit/ht_lsa_sync_jit.cuh
++++ b/nccl_ep/device/jit/ht_lsa_sync_jit.cuh
+@@ -87,6 +87,22 @@ inline ncclResult_t launch_lsa_tail_sync(
+         "ht_lsa_tail_sync", kLsaTailSyncEntryName, source.c_str(), &variant_identity, &args, stream);
+ }
+ 
++inline ncclResult_t launch_comb_peer_signal(
++    const ::ht_ep::comb_peer_signal_param_t& args,
++    cudaStream_t stream) {
++    static const int variant_identity = 0;
++    static const std::string source =
++        "#include \"device/ht_ep.cuh\"\n"
++        "extern \"C\" __launch_bounds__(32, 1)\n"
++        "__global__ void nccl_ep_jit_ht_comb_peer_signal_kernel(\n"
++        "    const __grid_constant__ ::ht_ep::comb_peer_signal_param_t p) {\n"
++        "  ::ht_ep::comb_peer_signal(p);\n"
++        "}\n";
++    ::ht_ep::comb_peer_signal_param_t a = args;
++    return launch_lsa_sync_jit(
++        "ht_comb_peer_signal", "nccl_ep_jit_ht_comb_peer_signal_kernel", source.c_str(), &variant_identity, &a, stream);
++}
++
+ } // namespace jit
+ } // namespace ht
+ } // namespace nccl_ep
+diff --git a/nccl_ep/ep_bench.cu b/nccl_ep/ep_bench.cu
+index 9b7146f..985d384 100644
+--- a/nccl_ep/ep_bench.cu
++++ b/nccl_ep/ep_bench.cu
+@@ -123,6 +123,19 @@ cuptiBufferCompleted(CUcontext /*ctx*/, uint32_t /*streamId*/, uint8_t* buf, siz
+             if (k->name) {
+                 g_kernel_stats[k->name].total_ns += k->end - k->start;
+                 g_kernel_stats[k->name].count++;
++                // Phase split of the unfused syncs (single stream: records arrive in order).
++                static int last_major = 0;  // 1 = dispatch pull, 2 = combine push, 0 = other
++                const std::string nm(k->name);
++                const char* split = nullptr;
++                if (nm.find("dispatch_pull") != std::string::npos) last_major = 1;
++                else if (nm.find("combine_push") != std::string::npos) last_major = 2;
++                else if (nm.find("epi_reduce") != std::string::npos) last_major = 0;
++                else if (nm.find("lsa_head_sync") != std::string::npos) split = last_major == 1 ? "SPLIT_hc" : "SPLIT_hd";
++                else if (nm.find("lsa_tail_sync") != std::string::npos) split = last_major == 1 ? "SPLIT_td" : "SPLIT_tc";
++                if (split) {
++                    g_kernel_stats[split].total_ns += k->end - k->start;
++                    g_kernel_stats[split].count++;
++                }
+             }
+         }
+     }
+@@ -985,6 +998,13 @@ static unsigned int benchmarkScalesPerToken(
+     }
+ }
+ 
++__global__ void ep_bench_spin_kernel(long long ns) {
++    unsigned long long t0;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
++    unsigned long long t = t0;
++    while (t - t0 < static_cast<unsigned long long>(ns)) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++}
++
+ static inline uint8_t scalesForwardTokenByte(int rank, unsigned int t, size_t h) {
+     if (h == 0) return static_cast<uint8_t>(rank);
+     if (h == 1) return static_cast<uint8_t>(t / 256u);
+@@ -4836,6 +4856,19 @@ void printHighThroughputResults(
+         local_head_sync_us = ktimer.get_avg_us("lsa_head_sync");
+         local_tail_sync_us = ktimer.get_avg_us("lsa_tail_sync");
+         MPI_Reduce(&local_head_sync_us, &global_head_sync_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
++        {
++            double loc[5] = {ktimer.get_avg_us("SPLIT_hd"), ktimer.get_avg_us("SPLIT_hc"), ktimer.get_avg_us("SPLIT_td"),
++                             ktimer.get_avg_us("SPLIT_tc"), ktimer.get_avg_us("comb_peer_signal")};
++            double glob[5] = {0, 0, 0, 0, 0};
++            MPI_Reduce(loc, glob, 5, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
++            int nr = 1;
++            MPI_Comm_size(MPI_COMM_WORLD, &nr);
++            int me = 0;
++            MPI_Comm_rank(MPI_COMM_WORLD, &me);
++            if (me == 0)
++                printf("SyncSplit: head_disp=%.2f head_comb=%.2f tail_disp=%.2f tail_comb=%.2f peer_signal=%.2f us\n",
++                       glob[0] / nr, glob[1] / nr, glob[2] / nr, glob[3] / nr, glob[4] / nr);
++        }
+         MPI_Reduce(&local_tail_sync_us, &global_tail_sync_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+         MPI_Reduce(&local_dispatch_kernel_us, &global_kernel_dk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+         MPI_Reduce(&local_combine_kernel_us, &global_kernel_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+@@ -6649,6 +6682,19 @@ int main(int argc, char* argv[]) {
+     // ncclEpCombine with dispatch-format tensors.
+     std::function<void()> benchmark_combine_fn = combine_fn;
+     if (dispatch_only) benchmark_combine_fn = [] {};
++    if (const char* sk = getenv("EP_BENCH_COMBINE_SKEW_US")) {
++        const double max_us = atof(sk);
++        // Rank-dependent spin, spread evenly over [0, max_us] (rank 0 longest), emulating expert
++        // compute imbalance ahead of the combine.
++        const long long ns = static_cast<long long>(max_us * 1000.0 * ((nRanks - 1 - myRank) / double(nRanks > 1 ? nRanks - 1 : 1)));
++        if (myRank == 0) printf("EP_BENCH_COMBINE_SKEW_US=%.1f (rank spin 0..%.1f us)\n", max_us, max_us);
++        if (!dispatch_only && max_us > 0) {
++            benchmark_combine_fn = [&stream, ns, combine_fn]() {
++                ep_bench_spin_kernel<<<1, 32, 0, stream>>>(ns);
++                combine_fn();
++            };
++        }
++    }
+ 
+     // Times one paired dispatch+combine pass with the currently-wired direction.
+     // pass_update_fn is a parameter (not always the captured update_fn) so the backward
+diff --git a/nccl_ep/nccl_ep.cc b/nccl_ep/nccl_ep.cc
+index 03f7dd5..37e291c 100644
+--- a/nccl_ep/nccl_ep.cc
++++ b/nccl_ep/nccl_ep.cc
+@@ -34,6 +34,11 @@
+ #include "device/ht_ep_configs.cuh"
+ #include "device/ll_ep_adapter.cuh"
+ 
++// Push-combine peer gate (NCCL_EP_HT_COMBINE_PEER_GATE): inbox width (== ht_ep::kPullMaxLsaRanks)
++// and the completion-flag window size ([0..2) S2G flags, inbox, local count, pad).
++constexpr int kCombGateMaxRanks = 128;
++constexpr size_t kCompletionFlagsBytes = (2 + kCombGateMaxRanks + 2) * sizeof(uint32_t);
++
+ // NCCLCHECK macro for public API error checking
+ // Undef any existing definition from internal NCCL headers to avoid using ncclDebugLog
+ #ifdef NCCLCHECK
+@@ -959,6 +964,11 @@ struct ncclEpGroup {
+         // Merged completion flags
+         uint32_t* completion_flags_base = nullptr;
+         ncclWindow_t completion_flags_window = {};
++        // Push-combine peer gate (NCCL_EP_HT_COMBINE_PEER_GATE), carved from completion_flags_base:
++        // [2, 2 + kPullMaxLsaRanks) inbox (peer p writes slot p), then the local reduce count.
++        uint32_t* comb_gate_inbox = nullptr;
++        uint32_t* comb_gate_count = nullptr;
++        uint32_t* comb_gate_peer_slots[kCombGateMaxRanks] = {};
+ 
+         void* host_ptr_block = nullptr; // Single cudaHostAlloc for all pointer arrays
+ 
+@@ -1428,8 +1438,10 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config,
+ 
+     // Merged completion flags: allocate on all ranks as we will window register is collective
+     NCCL_CHECK_RESULT(
+-        ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), 2 * sizeof(uint32_t)));
+-    CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.completion_flags_base, 0, 2 * sizeof(uint32_t), stream));
++        ncclMemAlloc(reinterpret_cast<void**>(&ep_group->ht_buffers.completion_flags_base), kCompletionFlagsBytes));
++    CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.completion_flags_base, 0, kCompletionFlagsBytes, stream));
++    ep_group->ht_buffers.comb_gate_inbox = ep_group->ht_buffers.completion_flags_base + 2;
++    ep_group->ht_buffers.comb_gate_count = ep_group->ht_buffers.comb_gate_inbox + kCombGateMaxRanks;
+     ep_group->ht_buffers.dispatch_lsa_S2G_flags = ep_group->ht_buffers.completion_flags_base;
+     ep_group->ht_buffers.combine_lsa_S2G_flags = ep_group->ht_buffers.completion_flags_base + 1;
+ 
+@@ -1506,7 +1518,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config,
+     NCCL_CHECK_RESULT(ncclCommWindowRegister(
+         comm,
+         ep_group->ht_buffers.completion_flags_base,
+-        2 * sizeof(uint32_t),
++        kCompletionFlagsBytes,
+         &ep_group->ht_buffers.completion_flags_window,
+         NCCL_WIN_COLL_SYMMETRIC));
+ 
+@@ -1554,6 +1566,18 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config,
+         }
+     }
+ 
++    // Peer gate slots: my slot (index lsa_rank) in every team peer's inbox.
++    for (int i = 0; i < lsa_ranks; i++) {
++        uint32_t* inbox = ep_group->ht_buffers.comb_gate_inbox;
++        if (i != lsa_rank) {
++            void* ptr = nullptr;
++            NCCL_CHECK_RESULT(ncclGetPeerDevicePointer(
++                ep_group->ht_buffers.completion_flags_window, 0, ncclTeamRankToWorld(comm, lsa_team, i), &ptr));
++            inbox = static_cast<uint32_t*>(ptr) + 2;
++        }
++        ep_group->ht_buffers.comb_gate_peer_slots[i] = inbox + lsa_rank;
++    }
++
+     // Merged completion flags: resolve rank0 pointer from window.
+     if (lsa_rank != 0) {
+         int lsa_rank0_global = ncclTeamRankToWorld(comm, lsa_team, 0);
+@@ -6765,6 +6789,10 @@ ncclResult_t ncclEpCombine(
+                 assert(num_topk == handle->num_topk &&
+                        "push-combine backward: combined_topk_weights width must equal handle->num_topk");
+             }
++            // NCCL_EP_HT_COMBINE_PEER_GATE (unfused sync only): per-peer staging-free flags,
++            // published after every reduce below, replace the push head barrier.
++            const bool comb_peer_gate = nccl_ep_env_flag_on(group->env.ht_combine_peer_gate) &&
++                                        nccl_ep_env_flag_on(group->env.ht_unfused_sync);
+             // Peer staging + flag (+ backward prob-staging) base pointers ride the kernel
+             // launch arg (marshaled per call), so there is no shared host staging to race.
+             NCCLCHECK(nccl_ep::ht::launch_combine_push(
+@@ -6792,7 +6820,9 @@ ncclResult_t ncclEpCombine(
+                 backward_combine ? handle->ht.srcpos_map : nullptr,
+                 backward_combine,
+                 nccl_ep_env_flag_on(group->env.ht_unfused_sync),
+-                nccl_ep_env_flag_on(group->env.nucs)));
++                nccl_ep_env_flag_on(group->env.nucs),
++                comb_peer_gate ? group->ht_buffers.comb_gate_inbox : nullptr,
++                comb_peer_gate ? group->ht_buffers.comb_gate_count : nullptr));
+             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(
+                 combined_x->data,
+                 staging,
+@@ -6810,6 +6840,10 @@ ncclResult_t ncclEpCombine(
+                 backward_combine ? static_cast<float*>(combined_topk_weights->data) : nullptr,
+                 backward_combine ? handle->num_topk : 0,
+                 backward_combine));
++            if (comb_peer_gate) {
++                NCCLCHECK(nccl_ep::ht::launch_comb_peer_signal(
++                    group->ht_buffers.comb_gate_peer_slots, group->ht_buffers.comb_gate_count, team_size, stream));
++            }
+         } else {
+             if (em_permute_combine) {
+                 // MXFP8: app provides BF16; local_permute_reduce accumulates and quantizes to
+diff --git a/nccl_ep/nccl_ep_env.cc b/nccl_ep/nccl_ep_env.cc
+index c2180a5..fb793c5 100644
+--- a/nccl_ep/nccl_ep_env.cc
++++ b/nccl_ep/nccl_ep_env.cc
+@@ -91,6 +91,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
+     parse_flag(cfg->ht_em_pull_push);
+     parse_flag(cfg->nucs);
+     parse_flag(cfg->ht_unfused_sync);
++    parse_flag(cfg->ht_combine_peer_gate);
+     parse_flag(cfg->ht_em_ag_scan_mode);
+     parse_flag(cfg->ht_em_count_unfused);
+     parse_flag(cfg->disable_guard);
+@@ -169,6 +170,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
+         &cfg.ht_em_pull_push,
+         &cfg.nucs,
+         &cfg.ht_unfused_sync,
++        &cfg.ht_combine_peer_gate,
+         &cfg.ht_em_ag_scan_mode,
+         &cfg.ht_em_count_unfused,
+         &cfg.dispatch_copy_mode,
+diff --git a/nccl_ep/nccl_ep_env.h b/nccl_ep/nccl_ep_env.h
+index ab35566..cffe436 100644
+--- a/nccl_ep/nccl_ep_env.h
++++ b/nccl_ep/nccl_ep_env.h
+@@ -59,6 +59,9 @@ struct ncclEpEnvConfig {
+     // Launch the intra-LSA head and tail sync as separate kernels instead of
+     // fusing them into the dispatch/combine kernels. Pull-push only.
+     ncclEpEnvVar ht_unfused_sync{"NCCL_EP_HT_UNFUSED_SYNC", ncclEpEnvType::flag};
++    // Pull-push + unfused sync: replace the push-combine head barrier with per-peer
++    // staging-free flags published after each combine reduce (default off).
++    ncclEpEnvVar ht_combine_peer_gate{"NCCL_EP_HT_COMBINE_PEER_GATE", ncclEpEnvType::flag};
+     // Count exchange is the default HT EM path; set to fall back to the routing-map
+     // AllGather + scan path instead.
+     ncclEpEnvVar ht_em_ag_scan_mode{"NCCL_EP_HT_EM_AG_SCAN_MODE", ncclEpEnvType::flag};

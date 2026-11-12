@@ -277,6 +277,10 @@ class LayerNormLinearBwdArgs:
     # --- Per-backward scratch state (populated inside the backward impl) ---
     ub_obj_gradout: Optional[Any] = None
 
+    # --- Gradient fan-in (see LayerNormLinear.supports_grad_fanin) ---
+    grad_fanin: Optional[Any] = None
+    grad_fanin_accumulated: bool = False
+
     def setup_saved_tensors(self, ctx: torch.autograd.function.FunctionCtx) -> None:
         """Pull saved tensors from ``ctx`` into the fields backward consumes."""
         (
@@ -291,6 +295,10 @@ class LayerNormLinearBwdArgs:
         ) = restore_from_func_ctx(
             ctx
         )  # pylint: disable=unbalanced-tuple-unpacking
+
+
+_MXFP8_NORM_TE_FUSED = os.getenv("MLPERF_MXFP8_NORM_TE_FUSED", "0") == "1"
+_NORM_FWD_USE_CUDNN_ENV = os.getenv("NVTE_NORM_FWD_USE_CUDNN", "0")
 
 
 def _layernorm_linear_forward_impl(
@@ -414,18 +422,36 @@ def _layernorm_linear_forward_impl(
 
     # Apply normalization
     nvtx_range_push(f"{nvtx_label}.norm")
-    ln_out, mu, rsigma = apply_normalization(
-        inputmat,
-        None,  # ln_out
-        ln_weight_cast,
-        ln_bias,
-        args.eps,
-        input_quantizer if with_quantized_norm else None,
-        inputmat.dtype,
-        args.normalization,
-        args.fwd_ln_sm_margin,
-        args.zero_centered_gamma,
+    # With NVTE_NORM_FWD_USE_CUDNN=1 an MXFP8-quantized norm takes cuDNN's kernel, whose scales
+    # are not in the GEMM layout, so the fprop GEMM and the wgrad GEMM each swizzle them again.
+    # MLPERF_MXFP8_NORM_TE_FUSED=1 sends only these norms to TE's fused RMSNorm + MXFP8 kernel,
+    # which writes GEMM-swizzled scales; unquantized norms keep cuDNN. The extension reads the
+    # env var on every call, so it is switched off around this call only.
+    te_fused_mxfp8_norm = (
+        _MXFP8_NORM_TE_FUSED
+        and with_quantized_norm
+        and isinstance(input_quantizer, MXFP8Quantizer)
+        and input_quantizer.optimize_for_gemm
+        and args.normalization == "RMSNorm"
     )
+    if te_fused_mxfp8_norm:
+        os.environ["NVTE_NORM_FWD_USE_CUDNN"] = "0"
+    try:
+        ln_out, mu, rsigma = apply_normalization(
+            inputmat,
+            None,  # ln_out
+            ln_weight_cast,
+            ln_bias,
+            args.eps,
+            input_quantizer if with_quantized_norm else None,
+            inputmat.dtype,
+            args.normalization,
+            args.fwd_ln_sm_margin,
+            args.zero_centered_gamma,
+        )
+    finally:
+        if te_fused_mxfp8_norm:
+            os.environ["NVTE_NORM_FWD_USE_CUDNN"] = _NORM_FWD_USE_CUDNN_ENV
     nvtx_range_pop(f"{nvtx_label}.norm")
 
     # Store unquantized layer norm output if we need to return it
@@ -1410,14 +1436,35 @@ def _layernorm_linear_backward_impl(
                 args.zero_centered_gamma,
             )
         elif args.normalization == "RMSNorm":
-            dgrad, dgamma = tex.rmsnorm_bwd(
-                dgrad,
-                inputmat,
-                rsigma,
-                ln_weight,
-                args.bwd_ln_sm_margin,
-                args.zero_centered_gamma,
-            )
+            fanin_acc = args.grad_fanin.accum_target() if args.grad_fanin is not None else None
+            if (
+                fanin_acc is not None
+                and fanin_acc.dtype == dgrad.dtype
+                and fanin_acc.dtype == ln_weight.dtype
+                and fanin_acc.is_contiguous()
+                and fanin_acc.numel() == inputmat.numel()
+            ):
+                # Gradient fan-in: add the other consumers' gradient (the residual branch) in
+                # the norm backward kernel instead of a separate elementwise add.
+                dgrad, dgamma = tex.rmsnorm_bwd_add(
+                    dgrad,
+                    inputmat,
+                    fanin_acc.view(inputmat.shape),
+                    rsigma,
+                    ln_weight,
+                    args.bwd_ln_sm_margin,
+                    args.zero_centered_gamma,
+                )
+                args.grad_fanin_accumulated = True
+            else:
+                dgrad, dgamma = tex.rmsnorm_bwd(
+                    dgrad,
+                    inputmat,
+                    rsigma,
+                    ln_weight,
+                    args.bwd_ln_sm_margin,
+                    args.zero_centered_gamma,
+                )
             dbeta = None
         nvtx_range_pop(f"{nvtx_label}.norm")
         clear_tensor_data(mu)
@@ -1451,6 +1498,16 @@ def _layernorm_linear_backward_impl(
         wgrad,
         grad_bias,
     )
+
+
+# Gradient fan-in handed from LayerNormLinear.forward to the _LayerNormLinear it launches.
+_PENDING_GRAD_FANIN: Optional[Any] = None
+
+
+def _take_pending_grad_fanin() -> Optional[Any]:
+    global _PENDING_GRAD_FANIN
+    fanin, _PENDING_GRAD_FANIN = _PENDING_GRAD_FANIN, None
+    return fanin
 
 
 class _LayerNormLinear(torch.autograd.Function):
@@ -1488,8 +1545,10 @@ class _LayerNormLinear(torch.autograd.Function):
             tensors_to_save_from_forward,
             ctx_attrs,
         ) = _layernorm_linear_forward_impl(fwd_args)
+        grad_fanin = _take_pending_grad_fanin()
         if ctx is not None:
             bwd_args = LayerNormLinearBwdArgs()
+            bwd_args.grad_fanin = grad_fanin
             tensors_to_save_from_setup = _layernorm_linear_setup_ctx(
                 bwd_args,
                 fwd_args,
@@ -1524,6 +1583,10 @@ class _LayerNormLinear(torch.autograd.Function):
         if bwd_args.ub_name is not None:
             nvtx_label = f"{nvtx_label}.{bwd_args.ub_name}"
         dgrad, dgamma, dbeta, wgrad, grad_bias = _layernorm_linear_backward_impl(bwd_args)
+        if bwd_args.grad_fanin is not None:
+            # Only the last fan-in consumer returns the summed input gradient.
+            dgrad = bwd_args.grad_fanin.finish(dgrad, accumulated=bwd_args.grad_fanin_accumulated)
+            bwd_args.grad_fanin = None
         reduce_and_update_bwd_fp8_tensors = bwd_args.reduce_and_update_bwd_fp8_tensors
         # Drop all references held by bwd_args (saved tensors, quantizers, weakrefs,
         # main_grad closure) so they don't outlive backward via ctx under retain_graph.
@@ -1641,6 +1704,11 @@ class LayerNormLinear(TransformerEngineBaseModule):
                    Requires PyTorch version 2.7.0 or higher. When set to ``None``, standard all-reduce
                    is used.
     """
+
+    # A caller may set ``module._grad_fanin`` (an object with ``accum_target()`` and
+    # ``finish(grad, accumulated)``) around one forward call; with RMSNorm, the norm backward of
+    # that call then adds the fan-in's running gradient sum (``rmsnorm_bwd_add``).
+    supports_grad_fanin = True
 
     def __init__(
         self,
@@ -2204,14 +2272,19 @@ class LayerNormLinear(TransformerEngineBaseModule):
             )
 
             if is_grad_enabled:
-                out, ln_out, new_weight_workspace = _LayerNormLinear.apply(
-                    inp,
-                    self.layer_norm_weight,
-                    self.layer_norm_bias,
-                    weight_tensor,
-                    linear_bias_tensor,
-                    fwd_args,
-                )
+                global _PENDING_GRAD_FANIN
+                _PENDING_GRAD_FANIN = self.__dict__.pop("_grad_fanin", None)
+                try:
+                    out, ln_out, new_weight_workspace = _LayerNormLinear.apply(
+                        inp,
+                        self.layer_norm_weight,
+                        self.layer_norm_bias,
+                        weight_tensor,
+                        linear_bias_tensor,
+                        fwd_args,
+                    )
+                finally:
+                    _PENDING_GRAD_FANIN = None
             else:
                 out, ln_out, new_weight_workspace = _LayerNormLinear.forward(
                     None,

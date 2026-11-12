@@ -5,6 +5,7 @@
 """Helper functions for using fp8/nvfp4 tensors as weights"""
 
 from typing import Optional, Union, List
+import os
 import torch
 
 import transformer_engine_torch as tex
@@ -283,14 +284,18 @@ def quantize_master_weights(
         if hasattr(model_weight, "clear_high_precision_init_val"):
             model_weight.clear_high_precision_init_val()
 
-        if master_weight is not None:
+        quantizer = model_weight._get_quantizer()
+
+        if master_weight is not None and not (
+            _OPTFUSE_NVFP4 and isinstance(quantizer, NVFP4Quantizer)
+        ):
             # When not using fp8/fp4_primary_weights, the master_weight (fp32) is first cast to
             # bf16/fp16, and then cast to fp8 during forward. Although it's not necessary when
             # fp8/fp4_primary_weights is enabled, we still keep this logic to keep numerical
             # consistency. So here we cast the master_weight to model_weight.dtype.
+            # (overlay_optfuse, MLPERF_OPTFUSE_NVFP4=1: NVFP4 masters stay FP32 here; the fused
+            # kernels round to model_weight.dtype in registers, or the fallback casts them.)
             master_weight = master_weight.to(model_weight.dtype)
-
-        quantizer = model_weight._get_quantizer()
 
         if isinstance(quantizer, NVFP4Quantizer):
             nvfp4_params.append(
@@ -763,6 +768,16 @@ def _cast_master_weights_to_nvfp4_2d(
     use_fsdp_shard_model_weights : bool, if True, it means that the model weights are sharded.
     """
 
+    if _OPTFUSE_NVFP4:
+        if _optfuse_nvfp4_2d(
+            params, group, use_fsdp_shard_model_weights, manual_post_all_gather_processing
+        ):
+            return
+        # Fallback: the masters were kept FP32 by quantize_master_weights; do TE's cast now.
+        params = [
+            (mw, (m.to(mw.dtype) if m is not None else None), so, fr) for mw, m, so, fr in params
+        ]
+
     device = params[0][0].device
     block_len = NVFP4_BLOCK_SCALING_SIZE
 
@@ -975,6 +990,176 @@ def _cast_master_weights_to_nvfp4_2d(
             block_len,
             scale_dtype=scale_dtype,
         )
+
+
+# ------------------------------------------------------------------------------------------------
+# overlay_optfuse (MLPERF_OPTFUSE_NVFP4=1): bit-identical fused NVFP4 2D master-weight cast.
+# One launch each for block amax (reads the FP32 master directly), global amax/scale (derived from the
+# all-reduced block amaxes, so the second all-reduce and the per-tensor amax kernels go away), fused
+# scale, and cast. Kernels: liboptfuse.so (overlay_optfuse/lib/optfuse.cu).
+# ------------------------------------------------------------------------------------------------
+_OPTFUSE_NVFP4 = os.getenv("MLPERF_OPTFUSE_NVFP4", "0") == "1"
+_OPTFUSE_DEBUG = os.getenv("MLPERF_OPTFUSE_DEBUG", "0") == "1"
+_optfuse_lib_handle = None
+_optfuse_cache = {}
+_OPTFUSE_NFIELDS = 19
+
+
+def _optfuse_lib():
+    global _optfuse_lib_handle
+    if _optfuse_lib_handle is None:
+        import ctypes
+
+        path = os.getenv(
+            "MLPERF_OPTFUSE_LIB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "liboptfuse.so")
+        )
+        try:
+            lib = ctypes.CDLL(path)
+            for fn in ("optfuse_amax", "optfuse_gscale", "optfuse_scale", "optfuse_cast", "optfuse_meta_size"):
+                getattr(lib, fn).restype = ctypes.c_int
+            assert lib.optfuse_meta_size() == 8 * _OPTFUSE_NFIELDS
+            _optfuse_lib_handle = lib
+        except (OSError, AssertionError) as e:  # pragma: no cover
+            if int(os.getenv("RANK", "0")) == 0:
+                print(f"[optfuse] cannot load {path}: {e}; using the TE NVFP4 cast")
+            _optfuse_lib_handle = False
+    return _optfuse_lib_handle
+
+
+def _optfuse_build(params, block_len):
+    """Persistent buffers + device metadata for one params list, or None if not eligible."""
+    import numpy as np
+
+    n = len(params)
+    device = params[0][0].device
+    cu_amax = [0]
+    rows = []
+    for model_weight, master_weight, start_offset, _ in params:
+        q = model_weight._get_quantizer()
+        if not isinstance(q, NVFP4Quantizer) or not q.with_2d_quantization:
+            return None
+        if len(model_weight.shape) != 2 or model_weight._rowwise_scale_inv is None:
+            return None
+        if model_weight._amax_rowwise is None or model_weight._rowwise_data is None:
+            return None
+        if model_weight.dtype not in (torch.bfloat16, torch.float32):
+            return None
+        ts = model_weight._rowwise_scale_inv
+        if not ts.is_contiguous() or ts.element_size() != 1 or ts.dim() != 2:
+            return None
+        if not model_weight._rowwise_data.is_contiguous():
+            return None
+        h, w = model_weight.shape
+        th, tw = (h + block_len - 1) // block_len, (w + block_len - 1) // block_len
+        cu_amax.append(cu_amax[-1] + th * tw)
+        has_master = master_weight is not None and master_weight.numel() > 0
+        if has_master:
+            if master_weight.dtype != torch.float32 or not master_weight.is_contiguous():
+                return None
+            if start_offset is None or start_offset % 2 != 0:
+                return None
+        rows.append((model_weight, master_weight if has_master else None, int(start_offset or 0), h, w, th, tw))
+    packed_amax = torch.zeros(cu_amax[-1], dtype=torch.float32, device=device)
+    packed_scale = torch.zeros(cu_amax[-1], dtype=torch.float32, device=device)
+    gamax = torch.zeros(n, dtype=torch.float32, device=device)
+    gscale = torch.zeros(n, dtype=torch.float32, device=device)
+    meta = np.zeros((n, _OPTFUSE_NFIELDS), dtype=np.int64)
+    tile_base = 0
+    scale_base = 0
+    for i, (mw, m, start, h, w, th, tw) in enumerate(rows):
+        length = m.numel() if m is not None else 0
+        ts = mw._rowwise_scale_inv
+        rows_padded = ts.shape[0]
+        rw = mw._rowwise_data
+        out_ptr = rw.data_ptr() + start // 2
+        if length > 0:
+            tr0 = (start // w) // block_len
+            tr1 = ((start + length - 1) // w) // block_len
+            ntiles = (tr1 - tr0 + 1) * tw
+        else:
+            tr0, ntiles = 0, 0
+        flags = 0
+        if m is not None and w % 4 == 0 and start % 4 == 0 and m.data_ptr() % 16 == 0:
+            flags |= 1
+        if w % 16 == 0 and start % 16 == 0 and out_ptr % 8 == 0:
+            flags |= 2
+        if mw.dtype == torch.bfloat16:
+            flags |= 4
+        meta[i] = [
+            m.data_ptr() if m is not None else 0, length, start, h, w, th, tw, tr0, tile_base,
+            packed_amax.data_ptr() + 4 * cu_amax[i], packed_scale.data_ptr() + 4 * cu_amax[i],
+            gamax.data_ptr() + 4 * i, gscale.data_ptr() + 4 * i, out_ptr, ts.data_ptr(),
+            mw._amax_rowwise.data_ptr(), rows_padded, scale_base, flags,
+        ]
+        tile_base += ntiles
+        scale_base += ((rows_padded + block_len - 1) // block_len) * tw
+    meta_dev = torch.from_numpy(meta).to(device)
+    torch.cuda.current_stream().synchronize()
+    return dict(
+        meta=meta_dev, n=n, total_tiles=tile_base, total_scale=scale_base, packed_amax=packed_amax,
+        packed_scale=packed_scale, gamax=gamax, gscale=gscale,
+        keep=[r[1] for r in rows],  # keep the master shards the metadata points to alive
+    )
+
+
+def _optfuse_nvfp4_2d(params, group, use_fsdp_shard_model_weights, manual_post_all_gather_processing):
+    """Returns True if the fused path handled the cast (bit-identical to the TE code below)."""
+    import ctypes
+
+    if use_fsdp_shard_model_weights or len(params) == 0:
+        return False
+    lib = _optfuse_lib()
+    if not lib:
+        return False
+    scale_dtypes = {p[0]._get_quantizer().scale_dtype for p in params}
+    if len(scale_dtypes) != 1:
+        return False
+    if tex.DType(int(scale_dtypes.pop())) != tex.DType.kFloat8E4M3:
+        return False
+    key = tuple(
+        (
+            id(mw),
+            mw._rowwise_data.data_ptr() if mw._rowwise_data is not None else 0,
+            mw._rowwise_scale_inv.data_ptr() if mw._rowwise_scale_inv is not None else 0,
+            mw._amax_rowwise.data_ptr() if mw._amax_rowwise is not None else 0,
+            m.data_ptr() if m is not None else 0,
+            m.numel() if m is not None else -1,
+            so,
+        )
+        for mw, m, so, _ in params
+    )
+    ent = _optfuse_cache.get(key)
+    if ent is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        ent = _optfuse_build(params, NVFP4_BLOCK_SCALING_SIZE)
+        if ent is None:
+            if _OPTFUSE_DEBUG:
+                print("[optfuse] params not eligible; TE fallback", flush=True)
+            _optfuse_cache[key] = False
+            return False
+        _optfuse_cache[key] = ent
+    elif ent is False:
+        return False
+
+    stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+    meta = ctypes.c_void_p(ent["meta"].data_ptr())
+    n = ent["n"]
+    ent["packed_amax"].zero_()
+    rc = lib.optfuse_amax(meta, n, ctypes.c_int64(ent["total_tiles"]), stream)
+    assert rc == 0, f"optfuse_amax failed ({rc})"
+    if ent["packed_amax"].numel() > 0:
+        torch.distributed.all_reduce(ent["packed_amax"], op=torch.distributed.ReduceOp.MAX, group=group)
+    rc = lib.optfuse_gscale(meta, n, stream)
+    assert rc == 0, f"optfuse_gscale failed ({rc})"
+    if not manual_post_all_gather_processing:
+        for model_weight, _, _, _ in params:
+            model_weight.update_usage(rowwise_usage=True, columnwise_usage=False)
+    rc = lib.optfuse_scale(meta, n, ctypes.c_int64(ent["total_scale"]), stream)
+    assert rc == 0, f"optfuse_scale failed ({rc})"
+    rc = lib.optfuse_cast(meta, n, ctypes.c_int64(ent["total_tiles"]), stream)
+    assert rc == 0, f"optfuse_cast failed ({rc})"
+    return True
 
 
 def _identity_storage_data(tensor):
@@ -1427,6 +1612,7 @@ def post_all_gather_processing(model_weights: Union[torch.Tensor, List[torch.Ten
     """
     if not isinstance(model_weights, list):
         model_weights = [model_weights]
+    _PARAM_GATHER_GENERATION[0] += 1
 
     # Collect NVFP4 tensors for batched processing
     nvfp4_tensors = []
@@ -1458,6 +1644,80 @@ def post_all_gather_processing(model_weights: Union[torch.Tensor, List[torch.Ten
     # Batch process all NVFP4 tensors with multi-tensor approach
     if nvfp4_tensors:
         _nvfp4_2d_multi_tensor_transpose(nvfp4_tensors)
+        refresh_nvfp4_weight_gemm_swizzle_cache(nvfp4_tensors)
+
+
+_NVFP4_WEIGHT_SWIZZLE_CACHE = os.getenv("NVTE_NVFP4_WEIGHT_SWIZZLE_CACHE", "0") == "1"
+
+# Bumped on every post-all-gather call, i.e. whenever quantized weights may have changed.
+_PARAM_GATHER_GENERATION = [0]
+
+
+def param_gather_generation() -> int:
+    """Host-side counter of quantized-weight refreshes, for caches keyed on weight contents."""
+    return _PARAM_GATHER_GENERATION[0]
+
+
+def refresh_nvfp4_weight_gemm_swizzle_cache(nvfp4_tensors: List[NVFP4Tensor]) -> None:
+    """Swizzle the scales of freshly gathered NVFP4 weights once for GEMM.
+
+    Primary NVFP4 weights keep compact scales (the all-gather and dequantize need that
+    layout), so every GEMM that reads them would otherwise swizzle the weight scales again,
+    once per microbatch. Only weights that a GEMM has asked for (``_gsw_wanted``, set by
+    ``general_gemm``) are cached. The swizzled scales are written into persistent buffers
+    in place, so GEMMs captured in a CUDA graph keep reading valid scales on every replay.
+    """
+    if not _NVFP4_WEIGHT_SWIZZLE_CACHE:
+        return
+    from .storage.nvfp4_tensor_storage import NVFP4TensorStorage
+
+    for t in nvfp4_tensors:
+        if not getattr(t, "_gsw_wanted", False) or t._with_gemm_swizzled_scales:
+            continue
+        if t._rowwise_data is None or t._columnwise_data is None:
+            continue
+        tmp = NVFP4TensorStorage(
+            rowwise_data=t._rowwise_data,
+            rowwise_scale_inv=t._rowwise_scale_inv,
+            columnwise_data=t._columnwise_data,
+            columnwise_scale_inv=t._columnwise_scale_inv,
+            amax_rowwise=t._amax_rowwise,
+            amax_columnwise=t._amax_columnwise,
+            fp4_dtype=t._fp4_dtype,
+            scale_dtype=t._scale_dtype,
+            quantizer=None,
+            with_gemm_swizzled_scales=False,
+            row_scaled_nvfp4=getattr(t, "_row_scaled_nvfp4", False),
+            nvfp4_use_4over6=getattr(t, "_nvfp4_use_4over6", False),
+            nvfp4_e4m3_max=getattr(t, "_nvfp4_e4m3_max", 0),
+        )
+        tex.swizzle_scales_for_gemm_(tmp)
+        row = getattr(t, "_gsw_row", None)
+        col = getattr(t, "_gsw_col", None)
+        if row is None or row.shape != tmp._rowwise_scale_inv.shape:
+            row = torch.empty_like(tmp._rowwise_scale_inv)
+            t._gsw_row = row
+        if col is None or col.shape != tmp._columnwise_scale_inv.shape:
+            col = torch.empty_like(tmp._columnwise_scale_inv)
+            t._gsw_col = col
+        row.copy_(tmp._rowwise_scale_inv)
+        col.copy_(tmp._columnwise_scale_inv)
+        t._gsw_view = NVFP4TensorStorage(
+            rowwise_data=t._rowwise_data,
+            rowwise_scale_inv=row,
+            columnwise_data=t._columnwise_data,
+            columnwise_scale_inv=col,
+            amax_rowwise=t._amax_rowwise,
+            amax_columnwise=t._amax_columnwise,
+            fp4_dtype=t._fp4_dtype,
+            scale_dtype=t._scale_dtype,
+            quantizer=t._quantizer,
+            with_gemm_swizzled_scales=True,
+            fake_dtype=t.dtype,
+            row_scaled_nvfp4=getattr(t, "_row_scaled_nvfp4", False),
+            nvfp4_use_4over6=getattr(t, "_nvfp4_use_4over6", False),
+            nvfp4_e4m3_max=getattr(t, "_nvfp4_e4m3_max", 0),
+        )
 
 
 def _nvfp4_2d_multi_tensor_transpose(nvfp4_tensors: List[NVFP4Tensor]):

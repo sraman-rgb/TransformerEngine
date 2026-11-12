@@ -726,6 +726,29 @@ def _cudnn_grouped_gemm_nvfp4_ue5m3(
     return out, None, None, None
 
 
+_NVFP4_WEIGHT_SWIZZLE_CACHE = os.getenv("NVTE_NVFP4_WEIGHT_SWIZZLE_CACHE", "0") == "1"
+_NVFP4_GROUPED_WEIGHT_SWIZZLE_CACHE = (
+    _NVFP4_WEIGHT_SWIZZLE_CACHE and os.getenv("NVTE_NVFP4_GROUPED_WEIGHT_SWIZZLE_CACHE", "0") == "1"
+)
+
+
+def _nvfp4_weight_swizzle_view(tensor):
+    """Use the per-step GEMM-swizzled scales of a primary NVFP4 weight if they exist.
+
+    The cache is filled by ``refresh_nvfp4_weight_gemm_swizzle_cache`` after each parameter
+    all-gather; until then the weight is marked so the next refresh builds it.
+    """
+    if type(tensor) is NVFP4TensorStorage or not isinstance(tensor, NVFP4TensorStorage):
+        return tensor
+    if tensor._with_gemm_swizzled_scales:
+        return tensor
+    view = getattr(tensor, "_gsw_view", None)
+    if view is not None:
+        return view
+    tensor._gsw_wanted = True
+    return tensor
+
+
 def general_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -759,6 +782,9 @@ def general_gemm(
 
     A = _unwrap_tensor(A, "rowwise" if transa else "columnwise")
     B = _unwrap_tensor(B, "columnwise" if transb else "rowwise")
+    if _NVFP4_WEIGHT_SWIZZLE_CACHE:
+        A = _nvfp4_weight_swizzle_view(A)
+        B = _nvfp4_weight_swizzle_view(B)
 
     alpha = validate_gemm_scale(alpha, True)
     beta = validate_gemm_scale(beta, accumulate)
@@ -1136,6 +1162,9 @@ def general_grouped_gemm_for_grouped_tensor(
     transb = layout[1] == "T"
     is_discrete_out = isinstance(out, list)
     is_discrete_in = isinstance(A, list)
+    if is_discrete_in and _NVFP4_GROUPED_WEIGHT_SWIZZLE_CACHE:
+        # Discrete expert weights would otherwise be swizzled inside every grouped GEMM.
+        A = [_nvfp4_weight_swizzle_view(a) for a in A]
     if is_discrete_in and is_discrete_out:
         raise ValueError("Both A and out are discrete. This is not supported yet.")
 

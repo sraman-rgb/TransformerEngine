@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Callable, Dict, Optional, Tuple, Union, List
+import math
 import warnings
 import weakref
 
@@ -303,6 +304,10 @@ class LinearBwdArgs:
 
     # --- Per-backward scratch state (populated inside _linear_backward_impl) ---
     ub_obj_gradout: Optional[Any] = None
+
+    # --- Gradient fan-in (see Linear.supports_grad_fanin) ---
+    grad_fanin: Optional[Any] = None
+    grad_fanin_accumulated: bool = False
 
     def setup_saved_tensors(self, ctx: torch.autograd.function.FunctionCtx) -> None:
         """Pull saved tensors from ``ctx`` into the fields backward consumes."""
@@ -1410,12 +1415,32 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 weight_for_dgrad = saved_weight
                 if isinstance(weight_for_dgrad, QuantizedTensorStorage):
                     weight_for_dgrad = weight_for_dgrad.dequantize(dtype=bwd_args.activation_dtype)
+            # Gradient fan-in: write dx straight into the running sum of the other consumers'
+            # gradients (GEMM epilogue accumulate) instead of returning it for autograd to add.
+            dgrad_accumulate = False
+            fanin_acc = (
+                bwd_args.grad_fanin.accum_target() if bwd_args.grad_fanin is not None else None
+            )
+            if (
+                fanin_acc is not None
+                and gemm_out is None
+                and reduce_scatter_out is None
+                and ub_obj_dgrad is None
+                and grad_input_quantizer is None
+                and not (bwd_args.parallel_mode == "column" and bwd_args.tp_size > 1)
+                and fanin_acc.dtype == bwd_args.activation_dtype
+                and fanin_acc.is_contiguous()
+                and fanin_acc.numel() == math.prod(grad_output.shape[:-1]) * dgrad_shape[-1]
+            ):
+                gemm_out = fanin_acc.view(*grad_output.shape[:-1], dgrad_shape[-1])
+                dgrad_accumulate = True
             gemm_out, *_, reduce_scatter_out = general_gemm(
                 weight_for_dgrad,
                 grad_output,
                 layout="NN",
                 grad=True,
                 quantization_params=grad_input_quantizer,
+                accumulate=dgrad_accumulate,
                 out=gemm_out,
                 out_dtype=bwd_args.activation_dtype,
                 use_split_accumulator=use_split_accumulator,
@@ -1424,6 +1449,7 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 extra_output=reduce_scatter_out,
                 bulk_overlap=bwd_args.ub_bulk_dgrad,
             )
+            bwd_args.grad_fanin_accumulated = dgrad_accumulate
             nvtx_range_pop(f"{nvtx_label}.dgrad_gemm")
 
             # FSDP2 only handles deallocation all-gathered weights that it allocates.
@@ -1837,8 +1863,10 @@ class _Linear(torch.autograd.Function):
             tensors_to_save_from_forward,
             ctx_attrs,
         ) = _linear_forward_impl(fwd_args)
+        grad_fanin = _take_pending_grad_fanin()
         if ctx is not None:
             bwd_args = LinearBwdArgs()
+            bwd_args.grad_fanin = grad_fanin
             tensors_to_save_from_setup = _linear_setup_ctx(
                 bwd_args,
                 fwd_args,
@@ -1875,6 +1903,14 @@ class _Linear(torch.autograd.Function):
         if bwd_args.ub_name is not None:
             nvtx_label = f"{nvtx_label}.{bwd_args.ub_name}"
         result = _linear_backward_impl(bwd_args) + (None,)  # fwd_args grad slot
+        if bwd_args.grad_fanin is not None:
+            # Slot 1 is the input gradient; only the last fan-in consumer returns the sum.
+            result = (
+                result[0],
+                bwd_args.grad_fanin.finish(result[1], accumulated=bwd_args.grad_fanin_accumulated),
+                *result[2:],
+            )
+            bwd_args.grad_fanin = None
         reduce_and_update_bwd_fp8_tensors = bwd_args.reduce_and_update_bwd_fp8_tensors
         # Drop all references held by bwd_args (saved tensors, quantizers, weakrefs,
         # main_grad closure) so they don't outlive backward via ctx under retain_graph.
@@ -1885,6 +1921,16 @@ class _Linear(torch.autograd.Function):
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
             nvtx_range_pop(f"{nvtx_label}.reduce_and_update_fp8_tensors")
         return result
+
+
+# Gradient fan-in handed from Linear.forward to the _Linear autograd function it launches.
+_PENDING_GRAD_FANIN: Optional[Any] = None
+
+
+def _take_pending_grad_fanin() -> Optional[Any]:
+    global _PENDING_GRAD_FANIN
+    fanin, _PENDING_GRAD_FANIN = _PENDING_GRAD_FANIN, None
+    return fanin
 
 
 @no_torch_dynamo()
@@ -1994,6 +2040,11 @@ class Linear(TransformerEngineBaseModule):
                        Requires an input quantizer that can safely reproduce its result from the
                        original input. Cannot work with FP8 DelayedScaling recipe.
     """
+
+    # A caller may set ``module._grad_fanin`` (an object with ``accum_target()`` and
+    # ``finish(grad, accumulated)``) around one forward call; the dgrad GEMM of that call then
+    # accumulates into the fan-in's running gradient sum.
+    supports_grad_fanin = True
 
     def __init__(
         self,
@@ -2550,13 +2601,20 @@ class Linear(TransformerEngineBaseModule):
                     )
                     use_compiled_op = False
 
+            grad_fanin = self.__dict__.pop("_grad_fanin", None)
             if use_compiled_op:
+                assert grad_fanin is None, "Gradient fan-in is not supported with torch.compile."
                 check_gemm_dims(inp, weight_tensor, self.fp8)
                 out, new_weight_workspace = _linear_op(fwd_args)
             else:
-                out, new_weight_workspace = _linear_eager(
-                    weight_tensor, inp, linear_bias_tensor, fwd_args, is_grad_enabled
-                )
+                global _PENDING_GRAD_FANIN
+                _PENDING_GRAD_FANIN = grad_fanin if is_grad_enabled else None
+                try:
+                    out, new_weight_workspace = _linear_eager(
+                        weight_tensor, inp, linear_bias_tensor, fwd_args, is_grad_enabled
+                    )
+                finally:
+                    _PENDING_GRAD_FANIN = None
 
             if new_weight_workspace is not None and cache_name is not None:
                 if isinstance(new_weight_workspace, torch.Tensor):

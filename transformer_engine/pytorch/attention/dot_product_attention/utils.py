@@ -3430,6 +3430,9 @@ def fused_mla_kv_rope_mxfp8(
     )
 
 
+_MXFP8_ATTN_FUSED_SWIZZLE = os.getenv("NVTE_MXFP8_ATTN_FUSED_SWIZZLE", "0") == "1"
+
+
 def mxfp8_transpose_swizzle(fp8_tensors, src_format):
     """Phase 2 of mxfp8_quantize_fast_path: batched BHSD-transpose + GEMM-swizzle.
 
@@ -3454,6 +3457,12 @@ def mxfp8_transpose_swizzle(fp8_tensors, src_format):
         "bshd",
         "sbhd",
     ), f"mxfp8_transpose_swizzle only supports bshd/sbhd, got {src_format!r}."
+
+    if _MXFP8_ATTN_FUSED_SWIZZLE and len(fp8_tensors) <= 3:
+        from .mxfp8_bhsd_swizzle import mxfp8_transpose_swizzle_fused
+
+        mxfp8_transpose_swizzle_fused(fp8_tensors, src_format)
+        return
 
     rs_list = [t._rowwise_scale_inv for t in fp8_tensors]
     cs_list = [t._columnwise_scale_inv for t in fp8_tensors]
