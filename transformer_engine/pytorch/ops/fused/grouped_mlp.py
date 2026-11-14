@@ -1589,6 +1589,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
 
         fc1_prob_tensor = None
         if not unit_activation_scale:
+            # cuDNN documents an FP32 prob for every recipe, and the backward uses FP32 too.
             fc1_prob_tensor = (
                 scales.detach().to(dtype=torch.float32).reshape((-1,) if canonical else (-1, 1, 1))
             )
