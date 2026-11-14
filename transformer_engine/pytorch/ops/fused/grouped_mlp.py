@@ -1589,10 +1589,11 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
 
         fc1_prob_tensor = None
         if not unit_activation_scale:
-            # cuDNN documents an FP32 prob for every recipe, and the backward uses FP32 too.
-            fc1_prob_tensor = (
-                scales.detach().to(dtype=torch.float32).reshape((-1,) if canonical else (-1, 1, 1))
-            )
+            fc1_prob_tensor = scales.detach()
+            if use_nvfp4:
+                # The cuDNN NVFP4 kernel only accepts FP32 router probability scales.
+                fc1_prob_tensor = fc1_prob_tensor.to(dtype=torch.float32)
+            fc1_prob_tensor = fc1_prob_tensor.reshape((-1,) if canonical else (-1, 1, 1))
         if use_nvfp4:
             # cuDNN receives NVFP4 block-scaled inputs without TE's per-group
             # global scale factors, so alpha supplies the product of the two
